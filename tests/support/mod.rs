@@ -4,8 +4,11 @@
 //! the fail-closed 303s).
 #![allow(dead_code)]
 
+use std::collections::{HashMap, VecDeque};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub struct Server {
     child: Child,
@@ -17,16 +20,22 @@ pub struct Server {
 
 impl Server {
     pub async fn start() -> Server {
+        Self::start_with_env(&[]).await
+    }
+
+    pub async fn start_with_env(extra: &[(&str, &str)]) -> Server {
         let data_dir = tempfile::tempdir().unwrap();
         let port = free_port();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sluice"))
-            .env("HOST", "127.0.0.1")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sluice"));
+        cmd.env("HOST", "127.0.0.1")
             .env("PORT", port.to_string())
             .env("DATA_DIR", data_dir.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sluice binary");
+            .stderr(Stdio::null());
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn sluice binary");
 
         let base_url = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::builder()
@@ -157,6 +166,87 @@ pub async fn start_mock_upstream() -> String {
         let _ = axum::serve(listener, app).await;
     });
     format!("http://127.0.0.1:{port}")
+}
+
+#[derive(Clone)]
+struct MockState {
+    violations: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
+    hits: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    limit: usize,
+    window: Duration,
+}
+
+async fn enforce_handler(
+    axum::extract::State(st): axum::extract::State<MockState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    st.total.fetch_add(1, Ordering::Relaxed);
+    let key = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let now = Instant::now();
+    let over = {
+        let mut map = st.hits.lock().unwrap();
+        let dq = map.entry(key).or_default();
+        while let Some(&front) = dq.front() {
+            if now.duration_since(front) >= st.window {
+                dq.pop_front();
+            } else {
+                break;
+            }
+        }
+        dq.push_back(now);
+        dq.len() > st.limit
+    };
+    if over {
+        st.violations.fetch_add(1, Ordering::Relaxed);
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":"rate"}"#,
+        )
+            .into_response();
+    }
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        r#"{"mock":"ok"}"#,
+    )
+        .into_response()
+}
+
+pub struct EnforcingMock {
+    pub base_url: String,
+    pub violations: Arc<AtomicUsize>,
+    pub total: Arc<AtomicUsize>,
+}
+
+/// A mock provider that strictly enforces `limit` requests per `window` per key,
+/// counting every excess as a violation — the yardstick the load test asserts on.
+pub async fn start_enforcing_mock(limit: usize, window: Duration) -> EnforcingMock {
+    let st = MockState {
+        violations: Arc::new(AtomicUsize::new(0)),
+        total: Arc::new(AtomicUsize::new(0)),
+        hits: Arc::new(Mutex::new(HashMap::new())),
+        limit,
+        window,
+    };
+    let (violations, total) = (st.violations.clone(), st.total.clone());
+    let app = axum::Router::new()
+        .route("/{*rest}", axum::routing::any(enforce_handler))
+        .with_state(st);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    EnforcingMock {
+        base_url: format!("http://127.0.0.1:{port}"),
+        violations,
+        total,
+    }
 }
 
 impl Drop for Server {

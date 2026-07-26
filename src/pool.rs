@@ -9,8 +9,12 @@ use std::time::{Duration, Instant};
 
 use crate::config::StoredConfig;
 
-/// The rate window every provider limiter is measured over.
-pub const WINDOW: Duration = Duration::from_secs(60);
+/// A provider's real per-key rate window; requests are limited per this span.
+pub const PROVIDER_WINDOW: Duration = Duration::from_secs(60);
+
+/// Slack added to the enforcement window so a boundary-timed request can't land
+/// inside the provider's real window after forwarding latency or clock skew.
+pub const JITTER_MARGIN: Duration = Duration::from_secs(1);
 
 /// Exact "N requests per rolling `window`" limiter. Time is injected so behavior
 /// is deterministically testable without real waiting.
@@ -111,11 +115,17 @@ pub struct Pool {
 
 impl Pool {
     pub fn new(specs: Vec<LaneSpec>) -> Self {
-        Self::with_window(specs, WINDOW)
+        Self::for_provider_window(specs, PROVIDER_WINDOW)
     }
 
-    /// Build with a custom window — tests use this to exercise pacing without
-    /// waiting a real minute.
+    /// Build lanes that enforce over the provider window *plus* the jitter margin,
+    /// keeping the proxy strictly under the provider's real per-key limit.
+    pub fn for_provider_window(specs: Vec<LaneSpec>, provider_window: Duration) -> Self {
+        Self::with_window(specs, provider_window + JITTER_MARGIN)
+    }
+
+    /// Build with an exact enforcement window (no margin) — tests use this to
+    /// exercise pacing without waiting a real minute.
     pub fn with_window(specs: Vec<LaneSpec>, window: Duration) -> Self {
         Self {
             lanes: specs.into_iter().map(|s| Lane::new(s, window)).collect(),

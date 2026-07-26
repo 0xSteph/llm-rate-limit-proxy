@@ -31,6 +31,8 @@ pub struct AppState {
     pub dispatch: dispatch::Dispatcher,
     /// Shared upstream HTTP client (connection pooling, no overall timeout).
     pub http: reqwest::Client,
+    /// The provider's real rate window; the pool enforces over this plus a margin.
+    pub provider_window: Duration,
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -143,8 +145,14 @@ pub async fn run() {
     };
     let setup_required = stored.superuser().is_none();
 
-    let pool: pool::PoolHandle = Arc::new(RwLock::new(Arc::new(pool::Pool::new(
+    // Undocumented test knob; 60s is the contract. Lets pacing tests run fast.
+    let provider_window = env_or("SLUICE_PROVIDER_WINDOW_MS", "")
+        .parse::<u64>()
+        .map(Duration::from_millis)
+        .unwrap_or(pool::PROVIDER_WINDOW);
+    let pool: pool::PoolHandle = Arc::new(RwLock::new(Arc::new(pool::Pool::for_provider_window(
         pool::lane_specs(&stored),
+        provider_window,
     ))));
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -161,6 +169,7 @@ pub async fn run() {
         dispatch: dispatch::Dispatcher::new(pool.clone()),
         pool,
         http,
+        provider_window,
     });
 
     let protected = Router::new()
