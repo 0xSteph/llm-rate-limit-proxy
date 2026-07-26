@@ -117,6 +117,46 @@ impl Server {
             .await
             .expect("POST failed")
     }
+
+    /// Complete setup and return the one-time client key from the response page.
+    pub async fn complete_wizard_get_key(
+        &self,
+        username: &str,
+        password: &str,
+        provider: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> String {
+        let body = self
+            .complete_wizard(username, password, provider, base_url, api_key)
+            .await
+            .text()
+            .await
+            .unwrap();
+        let start = body.find("<pre>").expect("client key in setup page") + "<pre>".len();
+        let end = start + body[start..].find("</pre>").expect("closing </pre>");
+        body[start..end].to_string()
+    }
+}
+
+/// A stand-in upstream provider: answers any path with a small JSON body, so a
+/// proxied request can be observed arriving on the other side.
+pub async fn start_mock_upstream() -> String {
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"mock":"ok"}"#,
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://127.0.0.1:{port}")
 }
 
 impl Drop for Server {

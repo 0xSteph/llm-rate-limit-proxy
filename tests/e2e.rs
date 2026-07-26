@@ -92,3 +92,44 @@ async fn repeated_bad_logins_get_throttled() {
     }
     assert_eq!(s.login("admin", "wrong").await.status(), 429);
 }
+
+// --- Proxy pass-through ------------------------------------------------------
+
+#[tokio::test]
+async fn proxies_keyed_request_through_to_provider() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    let key = s
+        .complete_wizard_get_key("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"x","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status(), 200);
+    let text = r.text().await.unwrap();
+    assert!(text.contains("\"mock\":\"ok\""), "proxied body was: {text}");
+}
+
+#[tokio::test]
+async fn proxy_rejects_missing_key() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+}

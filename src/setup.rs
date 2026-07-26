@@ -98,6 +98,10 @@ pub async fn setup_submit(
     }
     state.setup_required.store(false, Ordering::Relaxed);
 
+    // Rebuild the live pool so the just-added provider key is usable immediately.
+    let specs = crate::pool::lane_specs(&state.store.lock().unwrap());
+    *state.pool.write().unwrap() = Arc::new(crate::pool::Pool::new(specs));
+
     Html(format!(
         "<!doctype html><meta charset=utf-8><title>Sluice — Ready</title>\
          <h1>Setup complete</h1>\
