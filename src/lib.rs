@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod pool;
 pub mod setup;
 
 use std::sync::atomic::{AtomicBool, Ordering};
