@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod dispatch;
 pub mod pool;
 pub mod setup;
 

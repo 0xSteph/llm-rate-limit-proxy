@@ -64,9 +64,9 @@ pub struct Lane {
 }
 
 impl Lane {
-    fn new(spec: LaneSpec) -> Self {
+    fn new(spec: LaneSpec, window: Duration) -> Self {
         Self {
-            limiter: Mutex::new(SlidingWindow::new(spec.rpm, WINDOW)),
+            limiter: Mutex::new(SlidingWindow::new(spec.rpm, window)),
             provider: spec.provider,
             base_url: spec.base_url,
             key: spec.key,
@@ -111,8 +111,14 @@ pub struct Pool {
 
 impl Pool {
     pub fn new(specs: Vec<LaneSpec>) -> Self {
+        Self::with_window(specs, WINDOW)
+    }
+
+    /// Build with a custom window — tests use this to exercise pacing without
+    /// waiting a real minute.
+    pub fn with_window(specs: Vec<LaneSpec>, window: Duration) -> Self {
         Self {
-            lanes: specs.into_iter().map(Lane::new).collect(),
+            lanes: specs.into_iter().map(|s| Lane::new(s, window)).collect(),
         }
     }
 
@@ -137,6 +143,9 @@ impl Pool {
         &self.lanes
     }
 }
+
+/// A hot-swappable pool handle: settings can replace the pool without a restart.
+pub type PoolHandle = std::sync::Arc<std::sync::RwLock<std::sync::Arc<Pool>>>;
 
 #[cfg(test)]
 mod tests {
