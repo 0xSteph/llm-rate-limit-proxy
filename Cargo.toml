@@ -1,0 +1,43 @@
+[package]
+name = "sluice"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny, private, multi-provider OpenAI-compatible LLM gateway"
+license = "LicenseRef-Sluice-Source-Available"
+rust-version = "1.87"
+keywords = ["proxy", "openai", "llm", "gateway", "rate-limiting"]
+categories = ["network-programming", "web-programming::http-server"]
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+getrandom = "0.2"
+pbkdf2 = "0.12"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
+serde_json = "1"
+
+# PBKDF2 runs 600k HMAC-SHA256 iterations; at opt-level 0 every debug-build login
+# (and the auth tests) would take seconds. Bump only the hashing chain.
+[profile.dev]
+opt-level = 1
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+[profile.release]
+lto = true
+strip = true
+opt-level = 3
+codegen-units = 1

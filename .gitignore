@@ -1,0 +1,16 @@
+/target
+
+# Runtime data (config store, history) — never commit
+/data
+.env
+
+# Internal notes & AI working files — never publish
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.override.md
+.claude/
+notes/
+internal/
+scratch/
+docs/superpowers/
+specs/
