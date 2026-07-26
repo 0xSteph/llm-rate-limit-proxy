@@ -1,17 +1,37 @@
-//! Credential logic: password hashing, signed session tokens, and client API keys.
-//! Kept free of HTTP so it can be unit-tested in isolation; the middleware and
-//! login/logout handlers that use it are wired up in `lib.rs`.
+//! Credential logic and the operator auth surface: password hashing, signed session
+//! tokens, client API keys, the `require_session` guard, and login/logout. Kept in
+//! one place so the security posture is auditable from a single file.
 
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::extract::State;
+use axum::http::{header, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::Form;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::config::ClientKey;
+use crate::AppState;
 
 const PBKDF2_ROUNDS: u32 = 600_000;
+
+/// Session lifetime and the cookie it rides in.
+pub const SESSION_TTL: u64 = 12 * 3600;
+const SESSION_COOKIE: &str = "sluice_session";
+
+/// Failed-login throttle: after this many failures inside the window, further
+/// attempts are rejected until the window elapses.
+const MAX_LOGIN_FAILS: u32 = 5;
+const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -76,18 +96,32 @@ pub fn verify_password(pw: &str, stored: &str) -> bool {
 
 // --- Sessions ----------------------------------------------------------------
 
+struct LoginThrottle {
+    fails: u32,
+    window_start: Instant,
+}
+
 /// Session machinery: an HMAC signing key (random per boot, so sessions reset on
-/// restart) plus the `trust_proxy` flag that marks cookies `Secure` behind TLS.
+/// restart), the `trust_proxy` flag that marks cookies `Secure`, and the shared
+/// failed-login throttle.
 pub struct Admin {
     key: [u8; 32],
     trust_proxy: bool,
+    throttle: Mutex<LoginThrottle>,
 }
 
 impl Admin {
     pub fn new(trust_proxy: bool) -> Self {
         let mut key = [0u8; 32];
         getrandom::getrandom(&mut key).expect("system RNG");
-        Self { key, trust_proxy }
+        Self {
+            key,
+            trust_proxy,
+            throttle: Mutex::new(LoginThrottle {
+                fails: 0,
+                window_start: Instant::now(),
+            }),
+        }
     }
 
     /// Whether session cookies should carry the `Secure` attribute.
@@ -129,6 +163,151 @@ impl Admin {
         }
         Some(username.to_string())
     }
+
+    /// True while the failure window is saturated — reject new attempts.
+    pub fn is_throttled(&self) -> bool {
+        let t = self.throttle.lock().unwrap();
+        t.fails >= MAX_LOGIN_FAILS && t.window_start.elapsed() < LOGIN_WINDOW
+    }
+
+    fn record_login_failure(&self) {
+        let mut t = self.throttle.lock().unwrap();
+        if t.window_start.elapsed() >= LOGIN_WINDOW {
+            t.fails = 0;
+            t.window_start = Instant::now();
+        }
+        t.fails += 1;
+    }
+
+    fn reset_login_failures(&self) {
+        self.throttle.lock().unwrap().fails = 0;
+    }
+}
+
+fn session_cookie(token: &str, secure: bool) -> String {
+    let mut c = format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL}"
+    );
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+fn clear_cookie(secure: bool) -> String {
+    let mut c = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+fn session_from_cookies(header: Option<&str>) -> Option<String> {
+    let prefix = format!("{SESSION_COOKIE}=");
+    header?
+        .split(';')
+        .find_map(|p| p.trim().strip_prefix(&prefix).map(str::to_string))
+}
+
+// --- Operator auth surface ---------------------------------------------------
+
+/// Guard for the dashboard surface. Pre-setup, everything routes to the wizard;
+/// after setup, an unauthenticated request is bounced to the login page.
+pub async fn require_session(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if state.setup_required.load(Ordering::Relaxed) {
+        return Redirect::to("/setup").into_response();
+    }
+    let cookie = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    let authed = session_from_cookies(cookie)
+        .and_then(|t| state.admin.verify(&t))
+        .is_some();
+    if authed {
+        next.run(req).await
+    } else {
+        Redirect::to("/login").into_response()
+    }
+}
+
+const LOGIN_HTML: &str = r#"<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1">
+<title>Sluice — Sign in</title>
+<h1>Sluice</h1>
+<form method=post action=/login>
+  <p><input name=username placeholder=Username autofocus></p>
+  <p><input name=password type=password placeholder=Password></p>
+  <p><button type=submit>Sign in</button></p>
+</form>"#;
+
+pub async fn login_page() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        LOGIN_HTML,
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct LoginForm {
+    username: String,
+    password: String,
+}
+
+pub async fn login_submit(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    if state.admin.is_throttled() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many attempts, try again shortly",
+        )
+            .into_response();
+    }
+    let ok = {
+        let store = state.store.lock().unwrap();
+        store
+            .users
+            .iter()
+            .find(|u| u.username == form.username)
+            .map(|u| verify_password(&form.password, &u.pw_hash))
+            .unwrap_or(false)
+    };
+    if !ok {
+        state.admin.record_login_failure();
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+    state.admin.reset_login_failures();
+    let token = state.admin.mint(&form.username, SESSION_TTL);
+    let cookie = session_cookie(&token, state.admin.secure_cookies());
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::SET_COOKIE, cookie),
+            (header::LOCATION, "/".to_string()),
+        ],
+        "",
+    )
+        .into_response()
+}
+
+pub async fn logout(State(state): State<Arc<AppState>>) -> Response {
+    let cookie = clear_cookie(state.admin.secure_cookies());
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::SET_COOKIE, cookie),
+            (header::LOCATION, "/login".to_string()),
+        ],
+        "",
+    )
+        .into_response()
 }
 
 // --- Client API keys ---------------------------------------------------------
@@ -212,6 +391,28 @@ mod tests {
         let (a, b) = (Admin::new(false), Admin::new(false));
         let t = a.mint("alice", 3600);
         assert!(b.verify(&t).is_none());
+    }
+
+    #[test]
+    fn cookie_parse_finds_session() {
+        assert_eq!(
+            session_from_cookies(Some("foo=1; sluice_session=abc.def; bar=2")).as_deref(),
+            Some("abc.def")
+        );
+        assert!(session_from_cookies(Some("foo=1")).is_none());
+        assert!(session_from_cookies(None).is_none());
+    }
+
+    #[test]
+    fn throttle_trips_after_max_fails() {
+        let a = Admin::new(false);
+        for _ in 0..MAX_LOGIN_FAILS {
+            assert!(!a.is_throttled());
+            a.record_login_failure();
+        }
+        assert!(a.is_throttled());
+        a.reset_login_failures();
+        assert!(!a.is_throttled());
     }
 
     #[test]

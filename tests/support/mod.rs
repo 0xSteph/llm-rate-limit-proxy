@@ -71,6 +71,52 @@ impl Server {
             .await
             .expect("POST failed")
     }
+
+    /// A request from a brand-new client with no cookies — an anonymous browser.
+    pub async fn get_anon(&self, path: &str) -> reqwest::Response {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!("{}{path}", self.base_url))
+            .send()
+            .await
+            .expect("GET failed")
+    }
+
+    pub async fn complete_wizard(
+        &self,
+        username: &str,
+        password: &str,
+        provider: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> reqwest::Response {
+        self.post_form(
+            "/setup",
+            &[
+                ("username", username),
+                ("password", password),
+                ("provider_name", provider),
+                ("base_url", base_url),
+                ("api_key", api_key),
+            ],
+        )
+        .await
+    }
+
+    pub async fn login(&self, username: &str, password: &str) -> reqwest::Response {
+        self.post_form("/login", &[("username", username), ("password", password)])
+            .await
+    }
+
+    pub async fn logout(&self) -> reqwest::Response {
+        self.client
+            .post(format!("{}/logout", self.base_url))
+            .send()
+            .await
+            .expect("POST failed")
+    }
 }
 
 impl Drop for Server {

@@ -1,13 +1,16 @@
 pub mod auth;
 pub mod config;
+pub mod setup;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::Router;
+use axum::routing::{any, get, post};
+use axum::{Json, Router};
 
 /// Shared application state. One `Arc<AppState>` is handed to every request.
 pub struct AppState {
@@ -63,6 +66,35 @@ async fn root() -> impl IntoResponse {
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         "<!doctype html><meta charset=utf-8><title>Sluice</title><h1>Sluice</h1>",
     )
+}
+
+/// Phase-0 data-plane gate: closed with 503 until setup, then keyed. The real
+/// proxy lands in Phase 1; for now an authenticated request gets 501.
+async fn v1_gate(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if state.setup_required.load(Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": {"message": "setup required", "code": "setup_required"}})),
+        )
+            .into_response();
+    }
+    let clients = { state.store.lock().unwrap().clients.clone() };
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    match provided.and_then(|k| auth::verify_client_key(k, &clients)) {
+        Some(_) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": {"message": "proxy arrives in phase 1", "code": "not_implemented"}})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": {"message": "missing or invalid API key", "code": "unauthorized"}})),
+        )
+            .into_response(),
+    }
 }
 
 async fn shutdown_signal() {
@@ -141,9 +173,21 @@ pub async fn run() {
         started: unix_now(),
     });
 
-    let app = Router::new()
+    let protected = Router::new()
         .route("/", get(root))
+        .route("/dash", get(root))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session,
+        ));
+
+    let app = Router::new()
+        .merge(protected)
         .route("/health", get(|| async { "ok" }))
+        .route("/login", get(auth::login_page).post(auth::login_submit))
+        .route("/logout", post(auth::logout))
+        .route("/setup", get(setup::setup_page).post(setup::setup_submit))
+        .route("/v1/{*path}", any(v1_gate))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state);
 
