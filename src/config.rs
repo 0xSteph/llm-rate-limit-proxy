@@ -22,7 +22,20 @@ pub struct StoredConfig {
     #[serde(default)]
     pub providers: Vec<Provider>,
     #[serde(default)]
+    pub clients: Vec<ClientKey>,
+    #[serde(default)]
     pub settings: Settings,
+}
+
+/// A minted client API key. The secret is shown to the user exactly once; only its
+/// SHA-256 digest (+ last-4 for display) is ever stored.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ClientKey {
+    pub label: String,
+    pub digest: String,
+    pub last4: String,
+    #[serde(default)]
+    pub owner: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -163,6 +176,7 @@ mod tests {
                     owner: "admin".into(),
                 }],
             }],
+            clients: vec![],
             settings: Settings::default(),
         }
     }
