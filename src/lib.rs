@@ -63,6 +63,23 @@ async fn api_history(
     Json(state.history.range(from, to, 500))
 }
 
+async fn api_stats(State(state): State<Arc<AppState>>) -> Json<metrics::Stats> {
+    Json(state.metrics.stats())
+}
+
+/// Live bootstrap config for the dashboard (pool shape, capacity, uptime).
+async fn dash_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let pool = state.pool.read().unwrap().clone();
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "lanes": pool.len(),
+        "capacity_rpm": pool.capacity_rpm(),
+        "rpms": pool.rpms(),
+        "started": state.started,
+        "provider_window_secs": state.provider_window.as_secs(),
+    }))
+}
+
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_owned())
 }
@@ -101,7 +118,7 @@ async fn security_headers(req: axum::extract::Request, next: axum::middleware::N
 async fn root() -> impl IntoResponse {
     (
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        "<!doctype html><meta charset=utf-8><title>Sluice</title><h1>Sluice</h1>",
+        include_str!("dashboard.html"),
     )
 }
 
@@ -231,6 +248,8 @@ pub async fn run() {
         .route("/dash", get(root))
         .route("/metrics", get(metrics_handler))
         .route("/api/history", get(api_history))
+        .route("/api/stats", get(api_stats))
+        .route("/dash/config.json", get(dash_config))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,

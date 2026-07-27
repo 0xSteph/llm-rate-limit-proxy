@@ -371,3 +371,31 @@ async fn history_api_returns_json_array() {
         "expected JSON array: {body}"
     );
 }
+
+#[tokio::test]
+async fn dashboard_and_stats_served_after_login() {
+    let s = Server::start().await;
+    s.complete_wizard(
+        "admin",
+        "password123",
+        "mock",
+        "http://mock.test",
+        "provider-key",
+    )
+    .await;
+    s.login("admin", "password123").await;
+
+    let d = s.get("/").await;
+    assert_eq!(d.status(), 200);
+    assert_eq!(d.headers()["content-type"], "text/html; charset=utf-8");
+    let html = d.text().await.unwrap();
+    assert!(html.contains("gateway console"), "not the dashboard");
+
+    let st = s.get("/api/stats").await;
+    assert_eq!(st.status(), 200);
+    assert!(st.text().await.unwrap().contains("\"total\""));
+
+    let c = s.get("/dash/config.json").await;
+    assert_eq!(c.status(), 200);
+    assert!(c.text().await.unwrap().contains("capacity_rpm"));
+}

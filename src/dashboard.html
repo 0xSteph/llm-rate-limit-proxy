@@ -1,0 +1,406 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sluice · console</title>
+<style>
+  :root {
+    --bg: #080b12;
+    --panel: #0e1420;
+    --panel-2: #121a29;
+    --line: #1d2839;
+    --ink: #d5deec;
+    --dim: #6a7a91;
+    --accent: #35e0c4;
+    --accent-dim: #1c6f64;
+    --ok: #4ade80;
+    --warn: #f5b544;
+    --err: #f8726a;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "Cascadia Code",
+      "Roboto Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    background-image:
+      linear-gradient(var(--line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 44px 44px;
+    background-position: -1px -1px;
+  }
+  body::before {
+    content: "";
+    position: fixed; inset: 0; pointer-events: none;
+    background: radial-gradient(120% 80% at 50% -10%, rgba(53, 224, 196, 0.07), transparent 60%);
+  }
+  a { color: var(--accent); text-decoration: none; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 22px 20px 60px; position: relative; }
+
+  header {
+    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+    border-bottom: 1px solid var(--line); padding-bottom: 14px;
+  }
+  .mark { font-size: 20px; letter-spacing: 0.42em; font-weight: 700; color: var(--ink); text-transform: uppercase; }
+  .mark b { color: var(--accent); }
+  .tag { color: var(--dim); font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; }
+  .strip { margin-left: auto; display: flex; gap: 20px; flex-wrap: wrap; }
+  .strip div { color: var(--dim); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+  .strip b { display: block; color: var(--ink); font-size: 15px; letter-spacing: 0; text-transform: none; }
+  .live { color: var(--accent); }
+  .live::before { content: "● "; animation: pulse 2s infinite; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+
+  nav { display: flex; gap: 2px; margin: 20px 0 24px; border-bottom: 1px solid var(--line); }
+  nav button {
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    color: var(--dim); font-family: var(--mono); font-size: 12px; letter-spacing: 0.18em;
+    text-transform: uppercase; padding: 10px 16px; cursor: pointer; transition: color .15s, border-color .15s;
+  }
+  nav button:hover { color: var(--ink); }
+  nav button[aria-selected="true"] { color: var(--accent); border-color: var(--accent); }
+
+  .panel {
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--line); border-radius: 4px;
+  }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+  .tile { padding: 16px 18px; position: relative; overflow: hidden; }
+  .tile .k { color: var(--dim); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; }
+  .tile .v { font-size: 30px; margin-top: 8px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+  .tile .v small { font-size: 13px; color: var(--dim); }
+  .tile .bar { margin-top: 10px; }
+  .tile.accent .v { color: var(--accent); }
+
+  section.grid { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; margin-top: 14px; }
+  @media (max-width: 780px) { section.grid { grid-template-columns: 1fr; } nav { overflow-x: auto; } }
+  .card { padding: 16px 18px; }
+  .card h2 { font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--dim); margin: 0 0 14px; font-weight: 600; }
+
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--dim); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; cursor: pointer; user-select: none; font-weight: 600; }
+  th.num, td.num { text-align: right; }
+  tbody tr:hover { background: rgba(53, 224, 196, 0.05); }
+  td.name { color: var(--ink); }
+  .muted { color: var(--dim); }
+  .chip { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); }
+  .chip.ok { color: var(--ok); border-color: rgba(74,222,128,.35); }
+  .chip.err { color: var(--err); border-color: rgba(248,114,106,.35); }
+
+  .meter { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .meter > i { display: block; height: 100%; background: var(--accent); }
+  .lane { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; align-items: center; margin-bottom: 12px; }
+  .lane .lbl { font-size: 12px; }
+  .lane .val { color: var(--dim); font-size: 11px; }
+  .lane .meter { grid-column: 1 / -1; }
+
+  svg .axis { stroke: var(--line); }
+  svg .spark { fill: none; stroke: var(--accent); stroke-width: 1.6; }
+  svg .fillarea { fill: rgba(53,224,196,0.10); }
+
+  .empty { color: var(--dim); padding: 24px 4px; font-size: 12px; }
+  .hidden { display: none; }
+  .fade { opacity: 0; transform: translateY(6px); animation: rise .5s forwards; }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+  footer { margin-top: 30px; color: var(--dim); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; }
+</style>
+
+<div class="wrap">
+  <header class="fade">
+    <span class="mark">SL<b>/</b>UICE</span>
+    <span class="tag">gateway console</span>
+    <div class="strip" id="strip">
+      <div>status<b class="live" id="s-live">live</b></div>
+      <div>lanes<b id="s-lanes">–</b></div>
+      <div>capacity<b id="s-cap">–</b><span class="tag">rpm</span></div>
+      <div>uptime<b id="s-up">–</b></div>
+      <div>build<b id="s-ver">–</b></div>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="overview" aria-selected="true">Overview</button>
+    <button data-tab="models">Models</button>
+    <button data-tab="clients">Clients</button>
+    <button data-tab="capacity">Capacity</button>
+    <button data-tab="reliability">Reliability</button>
+  </nav>
+
+  <!-- OVERVIEW -->
+  <div id="overview" class="tab">
+    <div class="tiles">
+      <div class="panel tile accent"><div class="k">Requests</div><div class="v" id="t-req">0</div></div>
+      <div class="panel tile"><div class="k">Success rate</div><div class="v" id="t-succ">–</div><div class="bar"><div class="meter"><i id="t-succ-bar" style="width:0%"></i></div></div></div>
+      <div class="panel tile"><div class="k">Throughput</div><div class="v" id="t-rpm">0<small> req/min</small></div></div>
+      <div class="panel tile"><div class="k">Tokens moved</div><div class="v" id="t-tok">0</div></div>
+    </div>
+    <section class="grid">
+      <div class="panel card">
+        <h2>Requests over time</h2>
+        <svg id="chart" viewBox="0 0 720 180" preserveAspectRatio="none" style="width:100%;height:180px"></svg>
+        <div class="muted" id="chart-note" style="font-size:11px;margin-top:6px"></div>
+      </div>
+      <div class="panel card">
+        <h2>Top models</h2>
+        <table><tbody id="top-models"></tbody></table>
+      </div>
+    </section>
+  </div>
+
+  <!-- MODELS -->
+  <div id="models" class="tab hidden">
+    <div class="panel card">
+      <h2>Models — by traffic</h2>
+      <table id="tbl-models">
+        <thead><tr>
+          <th data-k="model">Model</th>
+          <th class="num" data-k="requests">Requests</th>
+          <th class="num" data-k="avg_latency_ms">Avg latency</th>
+          <th class="num" data-k="prompt_tokens">Prompt tok</th>
+          <th class="num" data-k="completion_tokens">Compl tok</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- CLIENTS -->
+  <div id="clients" class="tab hidden">
+    <div class="panel card">
+      <h2>Clients — who's calling</h2>
+      <table id="tbl-clients">
+        <thead><tr><th data-k="client">Client</th><th class="num" data-k="requests">Requests</th><th class="num">Share</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- CAPACITY -->
+  <div id="capacity" class="tab hidden">
+    <div class="tiles" style="margin-bottom:14px">
+      <div class="panel tile"><div class="k">Key lanes</div><div class="v" id="c-lanes">–</div></div>
+      <div class="panel tile accent"><div class="k">Aggregate ceiling</div><div class="v" id="c-cap">–<small> rpm</small></div></div>
+      <div class="panel tile"><div class="k">Window</div><div class="v" id="c-win">–<small> s</small></div></div>
+    </div>
+    <div class="panel card">
+      <h2>Traffic per provider lane</h2>
+      <div id="lanes"></div>
+      <div class="muted" style="font-size:11px" id="lanes-note"></div>
+    </div>
+  </div>
+
+  <!-- RELIABILITY -->
+  <div id="reliability" class="tab hidden">
+    <div class="tiles" style="margin-bottom:14px">
+      <div class="panel tile"><div class="k">Success rate</div><div class="v" id="r-succ">–</div></div>
+      <div class="panel tile"><div class="k">Errors</div><div class="v" id="r-err">0</div></div>
+    </div>
+    <div class="panel card">
+      <h2>Outcomes — by status code</h2>
+      <table id="tbl-status">
+        <thead><tr><th data-k="status">Status</th><th class="num" data-k="count">Count</th><th>Class</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <footer>sluice · content-blind telemetry — counts &amp; sizes only, never prompts</footer>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const nfmt = (n) => (n ?? 0).toLocaleString("en-US");
+  const pct = (n) => (n * 100).toFixed(n >= 0.9995 ? 0 : 1) + "%";
+  const classOf = (s) => { const c = +s; return c && c < 400 ? "ok" : "err"; };
+
+  let cfg = {}, stats = {}, hist = [];
+  const sortState = {}; // per-table
+
+  async function getJSON(url) {
+    const r = await fetch(url, { credentials: "same-origin" });
+    if (r.status === 303 || r.status === 401) { location.href = "/login"; return null; }
+    if (!r.ok) throw new Error(url + " → " + r.status);
+    return r.json();
+  }
+
+  function fmtUptime(startedUnix) {
+    if (!startedUnix) return "–";
+    let s = Math.max(0, Math.floor(Date.now() / 1000) - startedUnix);
+    const d = Math.floor(s / 86400); s %= 86400;
+    const h = Math.floor(s / 3600); s %= 3600;
+    const m = Math.floor(s / 60);
+    if (d) return d + "d " + h + "h";
+    if (h) return h + "h " + m + "m";
+    return m + "m";
+  }
+
+  function renderStrip() {
+    $("s-lanes").textContent = cfg.lanes ?? "–";
+    $("s-cap").textContent = nfmt(cfg.capacity_rpm);
+    $("s-up").textContent = fmtUptime(cfg.started);
+    $("s-ver").textContent = cfg.version ? "v" + cfg.version : "–";
+  }
+
+  function successRate() {
+    let ok = 0, total = 0;
+    for (const s of stats.statuses || []) { total += s.count; if (classOf(s.status) === "ok") ok += s.count; }
+    return total ? ok / total : 1;
+  }
+  function errorCount() {
+    let e = 0;
+    for (const s of stats.statuses || []) if (classOf(s.status) === "err") e += s.count;
+    return e;
+  }
+  function totalTokens() {
+    let t = 0;
+    for (const m of stats.models || []) t += (m.prompt_tokens || 0) + (m.completion_tokens || 0);
+    return t;
+  }
+  function rpm() {
+    // Derive from the last two history snapshots.
+    if (hist.length < 2) return 0;
+    const a = hist[hist.length - 2], b = hist[hist.length - 1];
+    const dt = Math.max(1, b.t - a.t);
+    return Math.max(0, Math.round(((b.total - a.total) / dt) * 60));
+  }
+
+  function renderOverview() {
+    $("t-req").textContent = nfmt(stats.total);
+    const sr = successRate();
+    $("t-succ").textContent = pct(sr);
+    $("t-succ-bar").style.width = (sr * 100).toFixed(1) + "%";
+    $("t-succ-bar").style.background = sr >= 0.999 ? "var(--ok)" : sr >= 0.95 ? "var(--warn)" : "var(--err)";
+    $("t-rpm").innerHTML = nfmt(rpm()) + "<small> req/min</small>";
+    $("t-tok").textContent = nfmt(totalTokens());
+
+    const top = [...(stats.models || [])].sort((a, b) => b.requests - a.requests).slice(0, 6);
+    $("top-models").innerHTML = top.length
+      ? top.map((m) => `<tr><td class="name">${esc(m.model)}</td><td class="num">${nfmt(m.requests)}</td></tr>`).join("")
+      : `<tr><td class="empty">No traffic yet — point a harness at /v1</td></tr>`;
+
+    drawChart();
+  }
+
+  function drawChart() {
+    const svg = $("chart"), W = 720, H = 180, pad = 6;
+    const pts = hist.map((s) => s.total);
+    if (pts.length < 2) {
+      svg.innerHTML = `<text x="12" y="26" fill="#6a7a91" font-size="12" font-family="var(--mono)">awaiting snapshots (every 5 min)…</text>`;
+      $("chart-note").textContent = "";
+      return;
+    }
+    const min = Math.min(...pts), max = Math.max(...pts), span = Math.max(1, max - min);
+    const dx = (W - pad * 2) / (pts.length - 1);
+    const y = (v) => H - pad - ((v - min) / span) * (H - pad * 2);
+    let d = "", area = `M${pad},${H - pad} `;
+    pts.forEach((v, i) => { const X = pad + i * dx, Y = y(v); d += (i ? "L" : "M") + X.toFixed(1) + "," + Y.toFixed(1) + " "; area += "L" + X.toFixed(1) + "," + Y.toFixed(1) + " "; });
+    area += `L${(pad + (pts.length - 1) * dx).toFixed(1)},${H - pad} Z`;
+    svg.innerHTML = `<path class="fillarea" d="${area}"/><path class="spark" d="${d}"/>`;
+    $("chart-note").textContent = `${pts.length} snapshots · ${nfmt(min)}–${nfmt(max)} cumulative requests`;
+  }
+
+  function sortRows(rows, key, tid) {
+    const st = sortState[tid] || { key, dir: -1 };
+    if (st.key === key) st.dir = -st.dir; else { st.key = key; st.dir = typeof rows[0]?.[key] === "number" ? -1 : 1; }
+    sortState[tid] = st;
+    return [...rows].sort((a, b) => {
+      const x = a[key], y = b[key];
+      return (typeof x === "number" ? x - y : String(x).localeCompare(String(y))) * st.dir;
+    });
+  }
+
+  function bindSort(tid, rowsFn) {
+    const t = $(tid);
+    t.querySelectorAll("th[data-k]").forEach((th) => th.onclick = () => renderTable(tid, sortRows(rowsFn(), th.dataset.k, tid)));
+  }
+
+  function renderTable(tid, rows) {
+    const body = $(tid).querySelector("tbody");
+    if (tid === "tbl-models") {
+      body.innerHTML = rows.length ? rows.map((m) => `<tr>
+        <td class="name">${esc(m.model)}</td>
+        <td class="num">${nfmt(m.requests)}</td>
+        <td class="num">${m.avg_latency_ms ? nfmt(m.avg_latency_ms) + " ms" : "<span class=muted>–</span>"}</td>
+        <td class="num">${nfmt(m.prompt_tokens)}</td>
+        <td class="num">${nfmt(m.completion_tokens)}</td></tr>`).join("")
+        : emptyRow(5);
+    } else if (tid === "tbl-clients") {
+      const total = rows.reduce((s, r) => s + r.requests, 0) || 1;
+      body.innerHTML = rows.length ? rows.map((c) => `<tr>
+        <td class="name">${esc(c.client)}</td>
+        <td class="num">${nfmt(c.requests)}</td>
+        <td class="num muted">${pct(c.requests / total)}</td></tr>`).join("")
+        : emptyRow(3);
+    } else if (tid === "tbl-status") {
+      body.innerHTML = rows.length ? rows.map((s) => `<tr>
+        <td class="name">${esc(s.status)}</td>
+        <td class="num">${nfmt(s.count)}</td>
+        <td><span class="chip ${classOf(s.status)}">${classOf(s.status) === "ok" ? "success" : "error"}</span></td></tr>`).join("")
+        : emptyRow(3);
+    }
+  }
+  const emptyRow = (n) => `<tr><td class="empty" colspan="${n}">No data yet</td></tr>`;
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function renderModels() { renderTable("tbl-models", sortState["tbl-models"] ? sortRows(stats.models || [], sortState["tbl-models"].key, "tbl-models") : [...(stats.models || [])].sort((a, b) => b.requests - a.requests)); }
+  function renderClients() { renderTable("tbl-clients", [...(stats.clients || [])].sort((a, b) => b.requests - a.requests)); }
+  function renderReliability() {
+    $("r-succ").textContent = pct(successRate());
+    $("r-err").textContent = nfmt(errorCount());
+    renderTable("tbl-status", [...(stats.statuses || [])].sort((a, b) => b.count - a.count));
+  }
+  function renderCapacity() {
+    $("c-lanes").textContent = cfg.lanes ?? "–";
+    $("c-cap").innerHTML = nfmt(cfg.capacity_rpm) + "<small> rpm</small>";
+    $("c-win").innerHTML = (cfg.provider_window_secs ?? "–") + "<small> s</small>";
+    const lanes = [...(stats.lanes || [])].sort((a, b) => b.requests - a.requests);
+    const max = Math.max(1, ...lanes.map((l) => l.requests));
+    $("lanes").innerHTML = lanes.length ? lanes.map((l) => `<div class="lane">
+      <span class="lbl">${esc(l.provider)}</span><span class="val">${nfmt(l.requests)} req</span>
+      <div class="meter"><i style="width:${(l.requests / max * 100).toFixed(1)}%"></i></div></div>`).join("")
+      : `<div class="empty">No lane traffic yet</div>`;
+    $("lanes-note").textContent = cfg.rpms ? "per-key ceilings: " + cfg.rpms.join(" / ") + " rpm" : "";
+  }
+
+  function renderAll() {
+    renderStrip(); renderOverview(); renderModels(); renderClients(); renderCapacity(); renderReliability();
+  }
+
+  // Tabs
+  const tabs = $("tabs");
+  tabs.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-tab]"); if (!b) return;
+    tabs.querySelectorAll("button").forEach((x) => x.setAttribute("aria-selected", x === b));
+    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("hidden", t.id !== b.dataset.tab));
+  });
+
+  bindSort("tbl-models", () => stats.models || []);
+  bindSort("tbl-clients", () => stats.clients || []);
+  bindSort("tbl-status", () => stats.statuses || []);
+
+  async function refresh() {
+    try {
+      const [c, s, h] = await Promise.all([
+        getJSON("/dash/config.json"), getJSON("/api/stats"), getJSON("/api/history"),
+      ]);
+      if (!c) return; // redirected to login
+      cfg = c; stats = s; hist = h || [];
+      $("s-live").textContent = "live";
+      renderAll();
+    } catch (err) {
+      $("s-live").textContent = "offline";
+      $("s-live").style.color = "var(--err)";
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 3000);
+})();
+</script>

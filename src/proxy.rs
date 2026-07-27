@@ -275,6 +275,7 @@ pub async fn handle(
             Some(Some(p)) => p,
         };
         let out_body = rewrite_model(&body, step.model.as_deref());
+        let t0 = Instant::now();
         let send = build_request(
             &state,
             &permit,
@@ -301,7 +302,11 @@ pub async fn handle(
                 state
                     .metrics
                     .record_request(&client, &model_label, &status.to_string());
-                return relay(resp).await;
+                state
+                    .metrics
+                    .record_latency(&model_label, t0.elapsed().as_millis() as u64);
+                state.metrics.record_lane(&permit.provider);
+                return relay(&state, &model_label, resp).await;
             }
             Err(e) => {
                 if !is_last {
@@ -325,8 +330,9 @@ pub async fn handle(
     )
 }
 
-/// Relay a buffered upstream response back to the client.
-async fn relay(upstream: reqwest::Response) -> Response {
+/// Relay a buffered upstream response back to the client, recording token usage
+/// (content-blind — only the counts from the `usage` object, never the text).
+async fn relay(state: &Arc<AppState>, model: &str, upstream: reqwest::Response) -> Response {
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut out = HeaderMap::new();
@@ -336,6 +342,18 @@ async fn relay(upstream: reqwest::Response) -> Response {
         }
     }
     let payload = upstream.bytes().await.unwrap_or_default();
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
+        if let Some(u) = v.get("usage") {
+            let p = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            let c = u
+                .get("completion_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            if p > 0 || c > 0 {
+                state.metrics.record_tokens(model, p, c);
+            }
+        }
+    }
     (status, out, payload).into_response()
 }
 
@@ -461,6 +479,7 @@ async fn stream_proxy(
                     continue;
                 }
                 state.metrics.record_request(&client, &model, "200");
+                state.metrics.record_lane(&permit.provider);
                 stream_body(resp, deadline, &tx).await;
                 return;
             }
