@@ -316,3 +316,37 @@ async fn virtual_model_falls_back_across_providers() {
         "alias name leaked upstream: {body}"
     );
 }
+
+#[tokio::test]
+async fn metrics_records_proxied_requests() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    let key = s
+        .complete_wizard_get_key("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {key}"))
+        .body(r#"{"model":"gpt-x","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // /metrics is on the operator surface — needs a session.
+    s.login("admin", "password123").await;
+    let m = s.get("/metrics").await;
+    assert_eq!(m.status(), 200);
+    let body = m.text().await.unwrap();
+    assert!(body.contains("sluice_requests_total"), "no metric: {body}");
+    assert!(
+        body.contains(r#"model="gpt-x""#),
+        "model not recorded: {body}"
+    );
+    assert!(
+        body.contains(r#"status="200""#),
+        "status not recorded: {body}"
+    );
+}

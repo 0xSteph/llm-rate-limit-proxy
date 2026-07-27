@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod dispatch;
+pub mod metrics;
 pub mod pool;
 pub mod proxy;
 pub mod setup;
@@ -9,6 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Router;
@@ -33,6 +35,18 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// The provider's real rate window; the pool enforces over this plus a margin.
     pub provider_window: Duration,
+    /// Content-blind request metrics (counts by client/model/status).
+    pub metrics: metrics::Metrics,
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        state.metrics.render(),
+    )
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -170,11 +184,13 @@ pub async fn run() {
         pool,
         http,
         provider_window,
+        metrics: metrics::Metrics::default(),
     });
 
     let protected = Router::new()
         .route("/", get(root))
         .route("/dash", get(root))
+        .route("/metrics", get(metrics_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,

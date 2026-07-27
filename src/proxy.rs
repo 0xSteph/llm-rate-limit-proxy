@@ -180,21 +180,21 @@ pub async fn handle(
         );
     }
 
-    // Keyed auth: a valid client key must be presented.
+    // Keyed auth: a valid client key must be presented. Its label is the metrics
+    // dimension for "who" — trusted (admin-set), never the secret.
     let clients = { state.store.lock().unwrap().clients.clone() };
-    let authed = headers
+    let client = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .and_then(|k| auth::verify_client_key(k, &clients))
-        .is_some();
-    if !authed {
+        .and_then(|k| auth::verify_client_key(k, &clients));
+    let Some(client) = client else {
         return err(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "missing or invalid API key",
         );
-    }
+    };
 
     if state.pool.read().unwrap().is_empty() {
         return err(
@@ -225,6 +225,8 @@ pub async fn handle(
         })
         .collect();
     let aliases = { state.store.lock().unwrap().aliases.clone() };
+    let requested = requested_model(&body);
+    let model_label = requested.clone().unwrap_or_else(|| "unknown".to_string());
 
     // Streaming: commit 200 text/event-stream now and drive the request in a worker
     // that heartbeats while it paces/retries, then relays the upstream SSE body.
@@ -238,6 +240,8 @@ pub async fn handle(
             body,
             deadline,
             aliases,
+            client,
+            model_label,
             tx,
         ));
         return (
@@ -250,7 +254,7 @@ pub async fn handle(
 
     // Buffered path: walk the plan, failing over on retryable errors.
     let pool_len = state.pool.read().unwrap().len();
-    let plan = resolve_plan(requested_model(&body).as_deref(), &aliases, pool_len);
+    let plan = resolve_plan(requested.as_deref(), &aliases, pool_len);
     let last = plan.len().saturating_sub(1);
     let mut excluded: Vec<usize> = Vec::new();
     for (i, step) in plan.iter().enumerate() {
@@ -263,7 +267,10 @@ pub async fn handle(
         )
         .await
         {
-            None => return deadline_exceeded(),
+            None => {
+                state.metrics.record_request(&client, &model_label, "504");
+                return deadline_exceeded();
+            }
             Some(None) => continue, // no eligible lane for this target
             Some(Some(p)) => p,
         };
@@ -279,7 +286,10 @@ pub async fn handle(
         .send();
         let sent = match with_deadline(deadline, send).await {
             Some(r) => r,
-            None => return deadline_exceeded(),
+            None => {
+                state.metrics.record_request(&client, &model_label, "504");
+                return deadline_exceeded();
+            }
         };
         match sent {
             Ok(resp) => {
@@ -287,6 +297,10 @@ pub async fn handle(
                     excluded.push(permit.lane_idx);
                     continue;
                 }
+                let status = resp.status().as_u16();
+                state
+                    .metrics
+                    .record_request(&client, &model_label, &status.to_string());
                 return relay(resp).await;
             }
             Err(e) => {
@@ -294,6 +308,7 @@ pub async fn handle(
                     excluded.push(permit.lane_idx);
                     continue;
                 }
+                state.metrics.record_request(&client, &model_label, "502");
                 return err(
                     StatusCode::BAD_GATEWAY,
                     "upstream_error",
@@ -302,6 +317,7 @@ pub async fn handle(
             }
         }
     }
+    state.metrics.record_request(&client, &model_label, "503");
     err(
         StatusCode::SERVICE_UNAVAILABLE,
         "no_capacity",
@@ -389,6 +405,8 @@ async fn stream_proxy(
     body: Bytes,
     deadline: Option<Instant>,
     aliases: Vec<Alias>,
+    client: String,
+    model: String,
     tx: Tx,
 ) {
     // Immediate heartbeat so the client sees the stream is live right away.
@@ -413,6 +431,7 @@ async fn stream_proxy(
             Ok(Some(p)) => p,
             Ok(None) => continue,
             Err(()) => {
+                state.metrics.record_request(&client, &model, "504");
                 let _ = tx.send(sse_error("deadline_exceeded")).await;
                 return;
             }
@@ -430,6 +449,7 @@ async fn stream_proxy(
         let sent = match with_deadline(deadline, send).await {
             Some(r) => r,
             None => {
+                state.metrics.record_request(&client, &model, "504");
                 let _ = tx.send(sse_error("deadline_exceeded")).await;
                 return;
             }
@@ -440,6 +460,7 @@ async fn stream_proxy(
                     excluded.push(permit.lane_idx);
                     continue;
                 }
+                state.metrics.record_request(&client, &model, "200");
                 stream_body(resp, deadline, &tx).await;
                 return;
             }
@@ -448,11 +469,13 @@ async fn stream_proxy(
                     excluded.push(permit.lane_idx);
                     continue;
                 }
+                state.metrics.record_request(&client, &model, "502");
                 let _ = tx.send(sse_error("upstream_error")).await;
                 return;
             }
         }
     }
+    state.metrics.record_request(&client, &model, "503");
     let _ = tx.send(sse_error("no_capacity")).await;
 }
 
