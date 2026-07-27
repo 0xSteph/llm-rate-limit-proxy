@@ -182,6 +182,26 @@ pub async fn start_mock_upstream() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// A mock provider that waits `delay` before answering — used to trip deadlines.
+pub async fn start_slow_mock(delay: Duration) -> String {
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(move || async move {
+            tokio::time::sleep(delay).await;
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"mock":"ok"}"#,
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
 /// A mock provider that 429s any request bearing `bad_key` and 200s the rest —
 /// lets a test prove the proxy fails a request over from a bad key to a good one.
 pub async fn start_failover_mock(bad_key: &str) -> String {

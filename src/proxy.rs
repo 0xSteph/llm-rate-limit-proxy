@@ -4,6 +4,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, State};
@@ -19,6 +20,40 @@ fn err(status: StatusCode, code: &str, message: &str) -> Response {
         Json(serde_json::json!({"error": {"message": message, "code": code}})),
     )
         .into_response()
+}
+
+/// Optional absolute wall-clock budget for the whole request (queue + retries +
+/// upstream), set by the client via this header.
+const DEADLINE_HEADER: &str = "x-sluice-deadline-ms";
+
+fn parse_deadline(headers: &HeaderMap) -> Option<Instant> {
+    headers
+        .get(DEADLINE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|ms| Instant::now() + Duration::from_millis(ms))
+}
+
+/// Run `fut` unless the deadline elapses first; `None` means the deadline hit.
+async fn with_deadline<F: std::future::Future>(
+    deadline: Option<Instant>,
+    fut: F,
+) -> Option<F::Output> {
+    match deadline {
+        Some(d) => {
+            let rem = d.saturating_duration_since(Instant::now());
+            tokio::time::timeout(rem, fut).await.ok()
+        }
+        None => Some(fut.await),
+    }
+}
+
+fn deadline_exceeded() -> Response {
+    err(
+        StatusCode::GATEWAY_TIMEOUT,
+        "deadline_exceeded",
+        "request deadline exceeded",
+    )
 }
 
 /// Headers we never copy from client→upstream or upstream→client.
@@ -95,20 +130,28 @@ pub async fn handle(
         })
         .collect();
 
+    let deadline = parse_deadline(&headers);
     let max_attempts = state.pool.read().unwrap().len().clamp(1, 4);
     let mut excluded: Vec<usize> = Vec::new();
     loop {
-        let permit = state.dispatch.acquire_excluding(&excluded).await;
+        let permit =
+            match with_deadline(deadline, state.dispatch.acquire_excluding(&excluded)).await {
+                Some(p) => p,
+                None => return deadline_exceeded(),
+            };
         let url = format!("{}{}", permit.base_url, path_query);
         let mut rb = state.http.request(rq_method.clone(), &url);
         for (n, v) in &fwd_headers {
             rb = rb.header(n, v);
         }
-        let sent = rb
+        let send = rb
             .header("authorization", format!("Bearer {}", permit.key))
             .body(body.clone())
-            .send()
-            .await;
+            .send();
+        let sent = match with_deadline(deadline, send).await {
+            Some(r) => r,
+            None => return deadline_exceeded(),
+        };
 
         let is_last = excluded.len() + 1 >= max_attempts;
         match sent {

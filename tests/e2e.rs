@@ -1,5 +1,7 @@
 mod support;
 
+use std::time::Duration;
+
 use support::Server;
 
 #[tokio::test]
@@ -182,4 +184,24 @@ async fn fails_over_from_bad_key_to_good_key() {
         .unwrap();
     assert_eq!(r.status(), 200);
     assert!(r.text().await.unwrap().contains("\"mock\":\"ok\""));
+}
+
+#[tokio::test]
+async fn deadline_exceeded_returns_504() {
+    let mock = support::start_slow_mock(Duration::from_secs(3)).await;
+    let s = Server::start().await;
+    let key = s
+        .complete_wizard_get_key("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {key}"))
+        .header("x-sluice-deadline-ms", "150")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 504);
 }
