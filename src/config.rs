@@ -24,7 +24,23 @@ pub struct StoredConfig {
     #[serde(default)]
     pub clients: Vec<ClientKey>,
     #[serde(default)]
+    pub aliases: Vec<Alias>,
+    #[serde(default)]
     pub settings: Settings,
+}
+
+/// A virtual model: a name a client can request that resolves to an ordered list
+/// of concrete targets, tried in turn (fallback chain).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Alias {
+    pub name: String,
+    pub targets: Vec<AliasTarget>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AliasTarget {
+    pub provider: String,
+    pub model: String,
 }
 
 /// A minted client API key. The secret is shown to the user exactly once; only its
@@ -177,6 +193,7 @@ mod tests {
                 }],
             }],
             clients: vec![],
+            aliases: vec![],
             settings: Settings::default(),
         }
     }

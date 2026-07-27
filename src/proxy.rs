@@ -1,6 +1,7 @@
-//! The data-plane proxy: authenticate the client, acquire a rate slot, then forward
-//! the request to that lane's provider and return the upstream response. Phase 1
-//! buffers the response; SSE heartbeats and true streaming arrive in Phase 2.
+//! The data-plane proxy: authenticate the client, resolve the requested model to a
+//! routing plan, then walk that plan — acquiring a rate slot per step, rewriting the
+//! model, forwarding, and failing over on retryable errors. Buffered and streaming
+//! (SSE, with heartbeats) responses share the same planning + failover logic.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -12,7 +13,17 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use crate::config::Alias;
+use crate::dispatch::Permit;
 use crate::{auth, AppState};
+
+const HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// Optional absolute wall-clock budget for the whole request (queue + retries +
+/// upstream), set by the client via this header.
+const DEADLINE_HEADER: &str = "x-sluice-deadline-ms";
+
+type Tx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
 
 fn err(status: StatusCode, code: &str, message: &str) -> Response {
     (
@@ -21,10 +32,6 @@ fn err(status: StatusCode, code: &str, message: &str) -> Response {
     )
         .into_response()
 }
-
-/// Optional absolute wall-clock budget for the whole request (queue + retries +
-/// upstream), set by the client via this header.
-const DEADLINE_HEADER: &str = "x-sluice-deadline-ms";
 
 fn parse_deadline(headers: &HeaderMap) -> Option<Instant> {
     headers
@@ -73,6 +80,91 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+fn is_retryable(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+// --- Routing plan ------------------------------------------------------------
+
+/// One attempt in a request's routing plan: which provider to target (any if
+/// `None`) and what model to send (unchanged if `None`).
+struct PlanStep {
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+/// Resolve the requested model to an ordered plan. An alias expands to its fallback
+/// targets; a plain model becomes up to a few "any lane, unchanged model" steps so
+/// key-level failover still applies.
+fn resolve_plan(model: Option<&str>, aliases: &[Alias], pool_len: usize) -> Vec<PlanStep> {
+    if let Some(name) = model {
+        if let Some(alias) = aliases.iter().find(|a| a.name == name) {
+            return alias
+                .targets
+                .iter()
+                .map(|t| PlanStep {
+                    provider: Some(t.provider.clone()),
+                    model: Some(t.model.clone()),
+                })
+                .collect();
+        }
+    }
+    (0..pool_len.clamp(1, 4))
+        .map(|_| PlanStep {
+            provider: None,
+            model: None,
+        })
+        .collect()
+}
+
+fn requested_model(body: &Bytes) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+}
+
+/// Return `body` with its `model` field replaced, or unchanged if there's no
+/// override or the body isn't a JSON object.
+fn rewrite_model(body: &Bytes, model: Option<&str>) -> Bytes {
+    let Some(model) = model else {
+        return body.clone();
+    };
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(model.to_string()),
+                );
+                if let Ok(bytes) = serde_json::to_vec(&v) {
+                    return Bytes::from(bytes);
+                }
+            }
+            body.clone()
+        }
+        Err(_) => body.clone(),
+    }
+}
+
+fn build_request(
+    state: &Arc<AppState>,
+    permit: &Permit,
+    method: &reqwest::Method,
+    path_query: &str,
+    fwd_headers: &[(String, String)],
+    body: Bytes,
+) -> reqwest::RequestBuilder {
+    let url = format!("{}{}", permit.base_url, path_query);
+    let mut rb = state.http.request(method.clone(), &url);
+    for (n, v) in fwd_headers {
+        rb = rb.header(n, v);
+    }
+    rb.header("authorization", format!("Bearer {}", permit.key))
+        .body(body)
+}
+
+// --- Entry point -------------------------------------------------------------
+
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     method: Method,
@@ -112,7 +204,7 @@ pub async fn handle(
         );
     }
 
-    // Common request shape for both the streaming and buffered paths.
+    // Common request shape for both paths.
     let deadline = parse_deadline(&headers);
     let path_query = uri
         .path_and_query()
@@ -132,6 +224,7 @@ pub async fn handle(
                 .map(|v| (n.as_str().to_string(), v.to_string()))
         })
         .collect();
+    let aliases = { state.store.lock().unwrap().aliases.clone() };
 
     // Streaming: commit 200 text/event-stream now and drive the request in a worker
     // that heartbeats while it paces/retries, then relays the upstream SSE body.
@@ -144,6 +237,7 @@ pub async fn handle(
             fwd_headers,
             body,
             deadline,
+            aliases,
             tx,
         ));
         return (
@@ -154,30 +248,39 @@ pub async fn handle(
             .into_response();
     }
 
-    // Buffered path: forward with automatic failover; relay the last response.
-    let max_attempts = state.pool.read().unwrap().len().clamp(1, 4);
+    // Buffered path: walk the plan, failing over on retryable errors.
+    let pool_len = state.pool.read().unwrap().len();
+    let plan = resolve_plan(requested_model(&body).as_deref(), &aliases, pool_len);
+    let last = plan.len().saturating_sub(1);
     let mut excluded: Vec<usize> = Vec::new();
-    loop {
-        let permit =
-            match with_deadline(deadline, state.dispatch.acquire_excluding(&excluded)).await {
-                Some(p) => p,
-                None => return deadline_exceeded(),
-            };
-        let url = format!("{}{}", permit.base_url, path_query);
-        let mut rb = state.http.request(rq_method.clone(), &url);
-        for (n, v) in &fwd_headers {
-            rb = rb.header(n, v);
-        }
-        let send = rb
-            .header("authorization", format!("Bearer {}", permit.key))
-            .body(body.clone())
-            .send();
+    for (i, step) in plan.iter().enumerate() {
+        let is_last = i == last;
+        let permit = match with_deadline(
+            deadline,
+            state
+                .dispatch
+                .acquire_for(step.provider.as_deref(), &excluded),
+        )
+        .await
+        {
+            None => return deadline_exceeded(),
+            Some(None) => continue, // no eligible lane for this target
+            Some(Some(p)) => p,
+        };
+        let out_body = rewrite_model(&body, step.model.as_deref());
+        let send = build_request(
+            &state,
+            &permit,
+            &rq_method,
+            &path_query,
+            &fwd_headers,
+            out_body,
+        )
+        .send();
         let sent = match with_deadline(deadline, send).await {
             Some(r) => r,
             None => return deadline_exceeded(),
         };
-
-        let is_last = excluded.len() + 1 >= max_attempts;
         match sent {
             Ok(resp) => {
                 if is_retryable(resp.status().as_u16()) && !is_last {
@@ -199,13 +302,14 @@ pub async fn handle(
             }
         }
     }
+    err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no_capacity",
+        "no provider lane available for the requested model",
+    )
 }
 
-fn is_retryable(status: u16) -> bool {
-    matches!(status, 429 | 500 | 502 | 503 | 504)
-}
-
-/// Relay an upstream response back to the client (status + content-type + body).
+/// Relay a buffered upstream response back to the client.
 async fn relay(upstream: reqwest::Response) -> Response {
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -220,10 +324,6 @@ async fn relay(upstream: reqwest::Response) -> Response {
 }
 
 // --- Streaming path ----------------------------------------------------------
-
-const HEARTBEAT: Duration = Duration::from_secs(15);
-
-type Tx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
 
 /// True if the client asked for a streamed response (`"stream": true`).
 fn wants_stream(body: &Bytes) -> bool {
@@ -243,15 +343,16 @@ fn sse_error(code: &str) -> Result<Bytes, std::io::Error> {
     )))
 }
 
-/// Acquire a slot while emitting heartbeats so the committed stream stays alive.
-/// `Err(())` means the deadline elapsed or the client hung up.
-async fn acquire_heartbeating(
+/// Acquire a slot for `provider` while emitting heartbeats so the committed stream
+/// stays alive. `Ok(None)` = no eligible lane; `Err(())` = deadline or client gone.
+async fn acquire_for_heartbeating(
     state: &Arc<AppState>,
+    provider: Option<&str>,
     excluded: &[usize],
     deadline: Option<Instant>,
     tx: &Tx,
-) -> Result<crate::dispatch::Permit, ()> {
-    let acq = state.dispatch.acquire_excluding(excluded);
+) -> Result<Option<Permit>, ()> {
+    let acq = state.dispatch.acquire_for(provider, excluded);
     tokio::pin!(acq);
     loop {
         let beat = tokio::time::sleep(HEARTBEAT);
@@ -260,7 +361,7 @@ async fn acquire_heartbeating(
             let dl = tokio::time::sleep(d.saturating_duration_since(Instant::now()));
             tokio::pin!(dl);
             tokio::select! {
-                p = &mut acq => return Ok(p),
+                r = &mut acq => return Ok(r),
                 _ = &mut dl => return Err(()),
                 _ = &mut beat => {
                     if tx.send(heartbeat_frame()).await.is_err() { return Err(()); }
@@ -268,7 +369,7 @@ async fn acquire_heartbeating(
             }
         } else {
             tokio::select! {
-                p = &mut acq => return Ok(p),
+                r = &mut acq => return Ok(r),
                 _ = &mut beat => {
                     if tx.send(heartbeat_frame()).await.is_err() { return Err(()); }
                 }
@@ -277,8 +378,9 @@ async fn acquire_heartbeating(
     }
 }
 
-/// Worker behind a committed `text/event-stream`: pace (heartbeating), fail over on
-/// retryable errors, then relay the upstream stream; terminal issues become SSE errors.
+/// Worker behind a committed `text/event-stream`: walk the plan (heartbeating while
+/// it paces/retries), then relay the upstream stream; terminal issues become SSE errors.
+#[allow(clippy::too_many_arguments)]
 async fn stream_proxy(
     state: Arc<AppState>,
     rq_method: reqwest::Method,
@@ -286,31 +388,45 @@ async fn stream_proxy(
     fwd_headers: Vec<(String, String)>,
     body: Bytes,
     deadline: Option<Instant>,
+    aliases: Vec<Alias>,
     tx: Tx,
 ) {
     // Immediate heartbeat so the client sees the stream is live right away.
     if tx.send(heartbeat_frame()).await.is_err() {
         return;
     }
-    let max_attempts = state.pool.read().unwrap().len().clamp(1, 4);
+    let pool_len = state.pool.read().unwrap().len();
+    let plan = resolve_plan(requested_model(&body).as_deref(), &aliases, pool_len);
+    let last = plan.len().saturating_sub(1);
     let mut excluded: Vec<usize> = Vec::new();
-    loop {
-        let permit = match acquire_heartbeating(&state, &excluded, deadline, &tx).await {
-            Ok(p) => p,
+    for (i, step) in plan.iter().enumerate() {
+        let is_last = i == last;
+        let permit = match acquire_for_heartbeating(
+            &state,
+            step.provider.as_deref(),
+            &excluded,
+            deadline,
+            &tx,
+        )
+        .await
+        {
+            Ok(Some(p)) => p,
+            Ok(None) => continue,
             Err(()) => {
                 let _ = tx.send(sse_error("deadline_exceeded")).await;
                 return;
             }
         };
-        let url = format!("{}{}", permit.base_url, path_query);
-        let mut rb = state.http.request(rq_method.clone(), &url);
-        for (n, v) in &fwd_headers {
-            rb = rb.header(n, v);
-        }
-        let send = rb
-            .header("authorization", format!("Bearer {}", permit.key))
-            .body(body.clone())
-            .send();
+        let out_body = rewrite_model(&body, step.model.as_deref());
+        let send = build_request(
+            &state,
+            &permit,
+            &rq_method,
+            &path_query,
+            &fwd_headers,
+            out_body,
+        )
+        .send();
         let sent = match with_deadline(deadline, send).await {
             Some(r) => r,
             None => {
@@ -318,8 +434,6 @@ async fn stream_proxy(
                 return;
             }
         };
-
-        let is_last = excluded.len() + 1 >= max_attempts;
         match sent {
             Ok(resp) => {
                 if is_retryable(resp.status().as_u16()) && !is_last {
@@ -339,6 +453,7 @@ async fn stream_proxy(
             }
         }
     }
+    let _ = tx.send(sse_error("no_capacity")).await;
 }
 
 /// Forward the upstream response body chunk-by-chunk into the client stream.

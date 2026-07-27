@@ -182,6 +182,26 @@ pub async fn start_mock_upstream() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// A mock provider that echoes the request body back — used to observe what the
+/// proxy actually forwarded (e.g. a rewritten model).
+pub async fn start_echo_mock() -> String {
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(|body: axum::body::Bytes| async move {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
 /// A mock provider that waits `delay` before answering — used to trip deadlines.
 pub async fn start_slow_mock(delay: Duration) -> String {
     let app = axum::Router::new().route(

@@ -169,6 +169,7 @@ async fn fails_over_from_bad_key_to_good_key() {
             ],
         }],
         clients: vec![client_rec],
+        aliases: vec![],
         settings: Default::default(),
     };
     let s = Server::start_seeded(&store, &[]).await;
@@ -232,4 +233,86 @@ async fn streaming_request_gets_heartbeat_and_body() {
         "no heartbeat in stream: {body}"
     );
     assert!(body.contains("mock"), "no upstream body in stream: {body}");
+}
+
+#[tokio::test]
+async fn virtual_model_falls_back_across_providers() {
+    use sluice::auth::{hash_password, new_client_key};
+    use sluice::config::{
+        Alias, AliasTarget, Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION,
+    };
+
+    let mock_a = support::start_failover_mock("pa-key").await; // 429s provider A's key
+    let mock_b = support::start_echo_mock().await; // provider B echoes the body
+    let (secret, client_rec) = new_client_key("test", "admin");
+
+    let store = StoredConfig {
+        version: STORE_VERSION,
+        users: vec![User {
+            username: "admin".into(),
+            pw_hash: hash_password("pw"),
+            role: Role::Superuser,
+        }],
+        providers: vec![
+            Provider {
+                name: "pa".into(),
+                base_url: mock_a,
+                keys: vec![ProviderKey {
+                    key: "pa-key".into(),
+                    enabled: true,
+                    rpm: 40,
+                    owner: "admin".into(),
+                }],
+            },
+            Provider {
+                name: "pb".into(),
+                base_url: mock_b,
+                keys: vec![ProviderKey {
+                    key: "pb-key".into(),
+                    enabled: true,
+                    rpm: 40,
+                    owner: "admin".into(),
+                }],
+            },
+        ],
+        clients: vec![client_rec],
+        aliases: vec![Alias {
+            name: "smart".into(),
+            targets: vec![
+                AliasTarget {
+                    provider: "pa".into(),
+                    model: "model-x".into(),
+                },
+                AliasTarget {
+                    provider: "pb".into(),
+                    model: "model-y".into(),
+                },
+            ],
+        }],
+        settings: Default::default(),
+    };
+    let s = Server::start_seeded(&store, &[]).await;
+
+    // `smart` resolves to [pa/model-x, pb/model-y]; pa 429s, so we fall over to pb,
+    // which echoes back the rewritten model.
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {secret}"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"smart","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("model-y"),
+        "expected the fallback target's model in the echo: {body}"
+    );
+    assert!(
+        !body.contains("smart"),
+        "alias name leaked upstream: {body}"
+    );
 }

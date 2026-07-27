@@ -29,41 +29,47 @@ impl Dispatcher {
         }
     }
 
-    /// Acquire a rate slot, blocking until one is available. Dropping the returned
-    /// future while still queued relinquishes the caller's place in line.
+    /// Acquire any rate slot, blocking until one is available. Convenience for
+    /// callers that don't care which provider or lane serves them.
     pub async fn acquire(&self) -> Permit {
-        self.acquire_excluding(&[]).await
+        self.acquire_for(None, &[])
+            .await
+            .expect("acquire on a non-empty pool")
     }
 
-    /// Like [`acquire`], but skips the given lane indices — used to fail a request
-    /// over to a *different* key after one lane returned a retryable error. Callers
-    /// must leave at least one lane unexcluded.
-    pub async fn acquire_excluding(&self, exclude: &[usize]) -> Permit {
+    /// Acquire a slot on a lane matching `provider` (any provider if `None`) and not
+    /// in `exclude`. Blocks while eligible lanes are saturated; returns `None`
+    /// immediately when *no* eligible lane exists, so the caller can fall through to
+    /// the next routing target. Fair (FIFO) via the gate; a dropped caller yields.
+    pub async fn acquire_for(&self, provider: Option<&str>, exclude: &[usize]) -> Option<Permit> {
         let _fifo = self.gate.lock().await;
         loop {
             let pool = self.pool.read().unwrap().clone();
             let now = Instant::now();
             let mut soonest: Option<Instant> = None;
+            let mut eligible = false;
             for (idx, lane) in pool.lanes().iter().enumerate() {
-                if exclude.contains(&idx) {
+                if provider.is_some_and(|p| lane.provider != p) || exclude.contains(&idx) {
                     continue;
                 }
+                eligible = true;
                 match lane.try_acquire(now) {
                     Ok(()) => {
-                        return Permit {
+                        return Some(Permit {
                             lane_idx: idx,
                             provider: lane.provider.clone(),
                             base_url: lane.base_url.clone(),
                             key: lane.key.clone(),
-                        };
+                        });
                     }
                     Err(retry_at) => {
                         soonest = Some(soonest.map_or(retry_at, |s| s.min(retry_at)));
                     }
                 }
             }
-            // No eligible lane ready: sleep until the soonest one frees (or briefly,
-            // if the pool is momentarily empty and settings may still fill it).
+            if !eligible {
+                return None;
+            }
             let wait = match soonest {
                 Some(t) => t.saturating_duration_since(Instant::now()),
                 None => Duration::from_millis(100),
