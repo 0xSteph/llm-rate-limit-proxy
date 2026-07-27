@@ -133,3 +133,53 @@ async fn proxy_rejects_missing_key() {
         .unwrap();
     assert_eq!(r.status(), 401);
 }
+
+#[tokio::test]
+async fn fails_over_from_bad_key_to_good_key() {
+    use sluice::auth::{hash_password, new_client_key};
+    use sluice::config::{Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION};
+
+    let mock = support::start_failover_mock("bad-key").await;
+    let (client_secret, client_rec) = new_client_key("test", "admin");
+    let store = StoredConfig {
+        version: STORE_VERSION,
+        users: vec![User {
+            username: "admin".into(),
+            pw_hash: hash_password("password123"),
+            role: Role::Superuser,
+        }],
+        providers: vec![Provider {
+            name: "mock".into(),
+            base_url: mock.clone(),
+            keys: vec![
+                ProviderKey {
+                    key: "bad-key".into(),
+                    enabled: true,
+                    rpm: 40,
+                    owner: "admin".into(),
+                },
+                ProviderKey {
+                    key: "good-key".into(),
+                    enabled: true,
+                    rpm: 40,
+                    owner: "admin".into(),
+                },
+            ],
+        }],
+        clients: vec![client_rec],
+        settings: Default::default(),
+    };
+    let s = Server::start_seeded(&store, &[]).await;
+
+    // First lane (bad-key) 429s; the proxy must fail over to good-key and return 200.
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {client_secret}"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("\"mock\":\"ok\""));
+}

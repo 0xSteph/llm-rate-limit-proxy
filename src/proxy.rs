@@ -77,38 +77,69 @@ pub async fn handle(
         );
     }
 
-    // Acquire a rate slot (may wait through pacing), then forward to that lane.
-    let permit = state.dispatch.acquire().await;
+    // Forward with automatic failover: on a retryable status or a connect error,
+    // exclude that lane and try a different key, up to a few distinct lanes. The
+    // last attempt's response (or a 502) is relayed as-is.
     let path_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/v1");
-    let url = format!("{}{}", permit.base_url, path_query);
-
     let rq_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
-    let mut rb = state.http.request(rq_method, &url);
-    for (name, value) in headers.iter() {
-        if name.as_str().eq_ignore_ascii_case("authorization") || is_hop_by_hop(name.as_str()) {
-            continue;
+    let fwd_headers: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(n, _)| {
+            !n.as_str().eq_ignore_ascii_case("authorization") && !is_hop_by_hop(n.as_str())
+        })
+        .filter_map(|(n, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (n.as_str().to_string(), v.to_string()))
+        })
+        .collect();
+
+    let max_attempts = state.pool.read().unwrap().len().clamp(1, 4);
+    let mut excluded: Vec<usize> = Vec::new();
+    loop {
+        let permit = state.dispatch.acquire_excluding(&excluded).await;
+        let url = format!("{}{}", permit.base_url, path_query);
+        let mut rb = state.http.request(rq_method.clone(), &url);
+        for (n, v) in &fwd_headers {
+            rb = rb.header(n, v);
         }
-        if let Ok(v) = value.to_str() {
-            rb = rb.header(name.as_str(), v);
+        let sent = rb
+            .header("authorization", format!("Bearer {}", permit.key))
+            .body(body.clone())
+            .send()
+            .await;
+
+        let is_last = excluded.len() + 1 >= max_attempts;
+        match sent {
+            Ok(resp) => {
+                if is_retryable(resp.status().as_u16()) && !is_last {
+                    excluded.push(permit.lane_idx);
+                    continue;
+                }
+                return relay(resp).await;
+            }
+            Err(e) => {
+                if !is_last {
+                    excluded.push(permit.lane_idx);
+                    continue;
+                }
+                return err(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    &format!("upstream request failed: {e}"),
+                );
+            }
         }
     }
-    let upstream = match rb
-        .header("authorization", format!("Bearer {}", permit.key))
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return err(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                &format!("upstream request failed: {e}"),
-            )
-        }
-    };
+}
 
+fn is_retryable(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Relay an upstream response back to the client (status + content-type + body).
+async fn relay(upstream: reqwest::Response) -> Response {
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut out = HeaderMap::new();

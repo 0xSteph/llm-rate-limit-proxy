@@ -32,12 +32,22 @@ impl Dispatcher {
     /// Acquire a rate slot, blocking until one is available. Dropping the returned
     /// future while still queued relinquishes the caller's place in line.
     pub async fn acquire(&self) -> Permit {
+        self.acquire_excluding(&[]).await
+    }
+
+    /// Like [`acquire`], but skips the given lane indices — used to fail a request
+    /// over to a *different* key after one lane returned a retryable error. Callers
+    /// must leave at least one lane unexcluded.
+    pub async fn acquire_excluding(&self, exclude: &[usize]) -> Permit {
         let _fifo = self.gate.lock().await;
         loop {
             let pool = self.pool.read().unwrap().clone();
             let now = Instant::now();
             let mut soonest: Option<Instant> = None;
             for (idx, lane) in pool.lanes().iter().enumerate() {
+                if exclude.contains(&idx) {
+                    continue;
+                }
                 match lane.try_acquire(now) {
                     Ok(()) => {
                         return Permit {
@@ -52,8 +62,8 @@ impl Dispatcher {
                     }
                 }
             }
-            // No lane ready: sleep until the soonest one frees (or briefly, if the
-            // pool is momentarily empty and settings may still fill it).
+            // No eligible lane ready: sleep until the soonest one frees (or briefly,
+            // if the pool is momentarily empty and settings may still fill it).
             let wait = match soonest {
                 Some(t) => t.saturating_duration_since(Instant::now()),
                 None => Duration::from_millis(100),

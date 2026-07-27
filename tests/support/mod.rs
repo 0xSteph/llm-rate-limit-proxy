@@ -24,7 +24,21 @@ impl Server {
     }
 
     pub async fn start_with_env(extra: &[(&str, &str)]) -> Server {
-        let data_dir = tempfile::tempdir().unwrap();
+        Self::spawn(tempfile::tempdir().unwrap(), extra).await
+    }
+
+    /// Boot with a pre-written config store (superuser already set up), for
+    /// scenarios the wizard can't express — e.g. multiple provider keys.
+    pub async fn start_seeded(
+        store: &sluice::config::StoredConfig,
+        extra: &[(&str, &str)],
+    ) -> Server {
+        let dir = tempfile::tempdir().unwrap();
+        sluice::config::save(dir.path(), store).expect("seed config store");
+        Self::spawn(dir, extra).await
+    }
+
+    async fn spawn(data_dir: tempfile::TempDir, extra: &[(&str, &str)]) -> Server {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_sluice"));
         cmd.env("HOST", "127.0.0.1")
@@ -158,6 +172,44 @@ pub async fn start_mock_upstream() -> String {
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 r#"{"mock":"ok"}"#,
             )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// A mock provider that 429s any request bearing `bad_key` and 200s the rest —
+/// lets a test prove the proxy fails a request over from a bad key to a good one.
+pub async fn start_failover_mock(bad_key: &str) -> String {
+    let bad = format!("Bearer {bad_key}");
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(move |headers: axum::http::HeaderMap| {
+            let bad = bad.clone();
+            async move {
+                use axum::response::IntoResponse;
+                let auth = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if auth == bad {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        r#"{"error":"rate"}"#,
+                    )
+                        .into_response()
+                } else {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"mock":"ok"}"#,
+                    )
+                        .into_response()
+                }
+            }
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
