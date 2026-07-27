@@ -350,3 +350,24 @@ async fn metrics_records_proxied_requests() {
         "status not recorded: {body}"
     );
 }
+
+#[tokio::test]
+async fn history_api_returns_json_array() {
+    let s = Server::start().await;
+    s.complete_wizard(
+        "admin",
+        "password123",
+        "mock",
+        "http://mock.test",
+        "provider-key",
+    )
+    .await;
+    s.login("admin", "password123").await;
+    let r = s.get("/api/history").await;
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.trim_start().starts_with('['),
+        "expected JSON array: {body}"
+    );
+}

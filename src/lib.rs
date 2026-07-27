@@ -1,19 +1,21 @@
 pub mod auth;
 pub mod config;
 pub mod dispatch;
+pub mod history;
 pub mod metrics;
 pub mod pool;
 pub mod proxy;
 pub mod setup;
 
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
-use axum::Router;
+use axum::{Json, Router};
 
 /// Shared application state. One `Arc<AppState>` is handed to every request.
 pub struct AppState {
@@ -37,6 +39,8 @@ pub struct AppState {
     pub provider_window: Duration,
     /// Content-blind request metrics (counts by client/model/status).
     pub metrics: metrics::Metrics,
+    /// Persisted 5-minute snapshots for range views.
+    pub history: Arc<history::History>,
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -47,6 +51,16 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         )],
         state.metrics.render(),
     )
+}
+
+async fn api_history(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Vec<history::Snapshot>> {
+    let now = unix_now();
+    let get = |k: &str, d: u64| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (from, to) = (get("from", now.saturating_sub(86_400)), get("to", now));
+    Json(state.history.range(from, to, 500))
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -159,6 +173,11 @@ pub async fn run() {
     };
     let setup_required = stored.superuser().is_none();
 
+    let history = Arc::new(history::History::load(
+        Some(data_dir.join("history.jsonl")),
+        stored.settings.history_days,
+    ));
+
     // Undocumented test knob; 60s is the contract. Lets pacing tests run fast.
     let provider_window = env_or("SLUICE_PROVIDER_WINDOW_MS", "")
         .parse::<u64>()
@@ -185,12 +204,33 @@ pub async fn run() {
         http,
         provider_window,
         metrics: metrics::Metrics::default(),
+        history,
     });
+
+    // Snapshot the request total on an interval so range views have trend data.
+    {
+        let history = state.history.clone();
+        let sampled = state.clone();
+        let sample_secs = env_or(
+            "SLUICE_HISTORY_SAMPLE_SECS",
+            &history::SAMPLE_SECS.to_string(),
+        )
+        .parse::<u64>()
+        .unwrap_or(history::SAMPLE_SECS)
+        .max(1);
+        tokio::spawn(async move {
+            loop {
+                history.append(unix_now(), sampled.metrics.total());
+                tokio::time::sleep(Duration::from_secs(sample_secs)).await;
+            }
+        });
+    }
 
     let protected = Router::new()
         .route("/", get(root))
         .route("/dash", get(root))
         .route("/metrics", get(metrics_handler))
+        .route("/api/history", get(api_history))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,

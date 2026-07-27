@@ -25,6 +25,11 @@ impl Metrics {
         *m.entry(key).or_insert(0) += 1;
     }
 
+    /// Cumulative count of all requests recorded so far.
+    pub fn total(&self) -> u64 {
+        self.requests.lock().unwrap().values().sum()
+    }
+
     pub fn render(&self) -> String {
         let m = self.requests.lock().unwrap();
         let mut out = String::new();
