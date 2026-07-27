@@ -205,3 +205,31 @@ async fn deadline_exceeded_returns_504() {
         .unwrap();
     assert_eq!(r.status(), 504);
 }
+
+#[tokio::test]
+async fn streaming_request_gets_heartbeat_and_body() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    let key = s
+        .complete_wizard_get_key("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"x","stream":true,"messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "text/event-stream");
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains(": heartbeat"),
+        "no heartbeat in stream: {body}"
+    );
+    assert!(body.contains("mock"), "no upstream body in stream: {body}");
+}

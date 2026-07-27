@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -112,10 +112,13 @@ pub async fn handle(
         );
     }
 
-    // Forward with automatic failover: on a retryable status or a connect error,
-    // exclude that lane and try a different key, up to a few distinct lanes. The
-    // last attempt's response (or a 502) is relayed as-is.
-    let path_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/v1");
+    // Common request shape for both the streaming and buffered paths.
+    let deadline = parse_deadline(&headers);
+    let path_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/v1")
+        .to_string();
     let rq_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
     let fwd_headers: Vec<(String, String)> = headers
@@ -130,7 +133,28 @@ pub async fn handle(
         })
         .collect();
 
-    let deadline = parse_deadline(&headers);
+    // Streaming: commit 200 text/event-stream now and drive the request in a worker
+    // that heartbeats while it paces/retries, then relays the upstream SSE body.
+    if wants_stream(&body) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+        tokio::spawn(stream_proxy(
+            state.clone(),
+            rq_method,
+            path_query,
+            fwd_headers,
+            body,
+            deadline,
+            tx,
+        ));
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        )
+            .into_response();
+    }
+
+    // Buffered path: forward with automatic failover; relay the last response.
     let max_attempts = state.pool.read().unwrap().len().clamp(1, 4);
     let mut excluded: Vec<usize> = Vec::new();
     loop {
@@ -193,4 +217,150 @@ async fn relay(upstream: reqwest::Response) -> Response {
     }
     let payload = upstream.bytes().await.unwrap_or_default();
     (status, out, payload).into_response()
+}
+
+// --- Streaming path ----------------------------------------------------------
+
+const HEARTBEAT: Duration = Duration::from_secs(15);
+
+type Tx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
+
+/// True if the client asked for a streamed response (`"stream": true`).
+fn wants_stream(body: &Bytes) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn heartbeat_frame() -> Result<Bytes, std::io::Error> {
+    Ok(Bytes::from_static(b": heartbeat\n\n"))
+}
+
+fn sse_error(code: &str) -> Result<Bytes, std::io::Error> {
+    Ok(Bytes::from(format!(
+        "event: error\ndata: {{\"error\":{{\"code\":\"{code}\"}}}}\n\n"
+    )))
+}
+
+/// Acquire a slot while emitting heartbeats so the committed stream stays alive.
+/// `Err(())` means the deadline elapsed or the client hung up.
+async fn acquire_heartbeating(
+    state: &Arc<AppState>,
+    excluded: &[usize],
+    deadline: Option<Instant>,
+    tx: &Tx,
+) -> Result<crate::dispatch::Permit, ()> {
+    let acq = state.dispatch.acquire_excluding(excluded);
+    tokio::pin!(acq);
+    loop {
+        let beat = tokio::time::sleep(HEARTBEAT);
+        tokio::pin!(beat);
+        if let Some(d) = deadline {
+            let dl = tokio::time::sleep(d.saturating_duration_since(Instant::now()));
+            tokio::pin!(dl);
+            tokio::select! {
+                p = &mut acq => return Ok(p),
+                _ = &mut dl => return Err(()),
+                _ = &mut beat => {
+                    if tx.send(heartbeat_frame()).await.is_err() { return Err(()); }
+                }
+            }
+        } else {
+            tokio::select! {
+                p = &mut acq => return Ok(p),
+                _ = &mut beat => {
+                    if tx.send(heartbeat_frame()).await.is_err() { return Err(()); }
+                }
+            }
+        }
+    }
+}
+
+/// Worker behind a committed `text/event-stream`: pace (heartbeating), fail over on
+/// retryable errors, then relay the upstream stream; terminal issues become SSE errors.
+async fn stream_proxy(
+    state: Arc<AppState>,
+    rq_method: reqwest::Method,
+    path_query: String,
+    fwd_headers: Vec<(String, String)>,
+    body: Bytes,
+    deadline: Option<Instant>,
+    tx: Tx,
+) {
+    // Immediate heartbeat so the client sees the stream is live right away.
+    if tx.send(heartbeat_frame()).await.is_err() {
+        return;
+    }
+    let max_attempts = state.pool.read().unwrap().len().clamp(1, 4);
+    let mut excluded: Vec<usize> = Vec::new();
+    loop {
+        let permit = match acquire_heartbeating(&state, &excluded, deadline, &tx).await {
+            Ok(p) => p,
+            Err(()) => {
+                let _ = tx.send(sse_error("deadline_exceeded")).await;
+                return;
+            }
+        };
+        let url = format!("{}{}", permit.base_url, path_query);
+        let mut rb = state.http.request(rq_method.clone(), &url);
+        for (n, v) in &fwd_headers {
+            rb = rb.header(n, v);
+        }
+        let send = rb
+            .header("authorization", format!("Bearer {}", permit.key))
+            .body(body.clone())
+            .send();
+        let sent = match with_deadline(deadline, send).await {
+            Some(r) => r,
+            None => {
+                let _ = tx.send(sse_error("deadline_exceeded")).await;
+                return;
+            }
+        };
+
+        let is_last = excluded.len() + 1 >= max_attempts;
+        match sent {
+            Ok(resp) => {
+                if is_retryable(resp.status().as_u16()) && !is_last {
+                    excluded.push(permit.lane_idx);
+                    continue;
+                }
+                stream_body(resp, deadline, &tx).await;
+                return;
+            }
+            Err(_) => {
+                if !is_last {
+                    excluded.push(permit.lane_idx);
+                    continue;
+                }
+                let _ = tx.send(sse_error("upstream_error")).await;
+                return;
+            }
+        }
+    }
+}
+
+/// Forward the upstream response body chunk-by-chunk into the client stream.
+async fn stream_body(resp: reqwest::Response, deadline: Option<Instant>, tx: &Tx) {
+    use futures_util::StreamExt;
+    let mut stream = Box::pin(resp.bytes_stream());
+    loop {
+        match with_deadline(deadline, stream.next()).await {
+            None => {
+                let _ = tx.send(sse_error("deadline_exceeded")).await;
+                return;
+            }
+            Some(None) => return, // upstream finished cleanly
+            Some(Some(Ok(chunk))) => {
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return; // client hung up
+                }
+            }
+            Some(Some(Err(_))) => {
+                let _ = tx.send(sse_error("stream_error")).await;
+                return;
+            }
+        }
+    }
 }
