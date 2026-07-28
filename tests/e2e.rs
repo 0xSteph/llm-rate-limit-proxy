@@ -1114,7 +1114,15 @@ async fn dashboard_and_stats_served_after_login() {
     assert_eq!(d.status(), 200);
     assert_eq!(d.headers()["content-type"], "text/html; charset=utf-8");
     let html = d.text().await.unwrap();
-    assert!(html.contains("gateway console"), "not the dashboard");
+    // Anchor on structure the script actually binds to, not on display copy —
+    // a restyle should not be able to fail this, but removing the tab shell or
+    // the status strip should.
+    assert!(html.contains("id=\"tabs\""), "no tab shell: {html:.200}");
+    assert!(html.contains("id=\"strip\""), "no status strip");
+    assert!(
+        html.contains("/api/stats"),
+        "console does not read the stats API"
+    );
 
     let st = s.get("/api/stats").await;
     assert_eq!(st.status(), 200);
