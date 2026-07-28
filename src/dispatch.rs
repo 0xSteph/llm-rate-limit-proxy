@@ -32,7 +32,7 @@ impl Dispatcher {
     /// Acquire any rate slot, blocking until one is available. Convenience for
     /// callers that don't care which provider or lane serves them.
     pub async fn acquire(&self) -> Permit {
-        self.acquire_for(None, &[])
+        self.acquire_for(None, &[], None)
             .await
             .expect("acquire on a non-empty pool")
     }
@@ -41,30 +41,49 @@ impl Dispatcher {
     /// in `exclude`. Blocks while eligible lanes are saturated; returns `None`
     /// immediately when *no* eligible lane exists, so the caller can fall through to
     /// the next routing target. Fair (FIFO) via the gate; a dropped caller yields.
-    pub async fn acquire_for(&self, provider: Option<&str>, exclude: &[usize]) -> Option<Permit> {
+    pub async fn acquire_for(
+        &self,
+        provider: Option<&str>,
+        exclude: &[usize],
+        session: Option<u64>,
+    ) -> Option<Permit> {
         let _fifo = self.gate.lock().await;
         loop {
             let pool = self.pool.read().unwrap().clone();
             let now = Instant::now();
             let mut soonest: Option<Instant> = None;
             let mut eligible = false;
+            // (spent budget, lane index) for every eligible lane with room left.
+            let mut with_room: Vec<(usize, usize)> = Vec::new();
             for (idx, lane) in pool.lanes().iter().enumerate() {
                 if provider.is_some_and(|p| lane.provider != p) || exclude.contains(&idx) {
                     continue;
                 }
                 eligible = true;
-                match lane.try_acquire(now) {
-                    Ok(()) => {
-                        return Some(Permit {
-                            lane_idx: idx,
-                            provider: lane.provider.clone(),
-                            base_url: lane.base_url.clone(),
-                            key: lane.key.clone(),
-                        });
-                    }
-                    Err(retry_at) => {
-                        soonest = Some(soonest.map_or(retry_at, |s| s.min(retry_at)));
-                    }
+                let load = lane.load(now);
+                if load < lane.rpm {
+                    with_room.push((load, idx));
+                } else if let Err(retry_at) = lane.try_acquire(now) {
+                    // A saturated lane records nothing, so this only reads its clock.
+                    soonest = Some(soonest.map_or(retry_at, |s: Instant| s.min(retry_at)));
+                }
+            }
+            // A conversation keeps its own lane while that lane has budget, so the
+            // upstream prefix cache stays warm; anything else takes the emptiest
+            // lane, spreading concurrent requests instead of stacking on lane 0.
+            // Ties break to the lower index, keeping the choice deterministic.
+            let choice = session
+                .and_then(|s| pool.affinity_among(s, with_room.iter().map(|&(_, i)| i)))
+                .or_else(|| with_room.iter().min().map(|&(_, i)| i));
+            if let Some(idx) = choice {
+                let lane = &pool.lanes()[idx];
+                if lane.try_acquire(now).is_ok() {
+                    return Some(Permit {
+                        lane_idx: idx,
+                        provider: lane.provider.clone(),
+                        base_url: lane.base_url.clone(),
+                        key: lane.key.clone(),
+                    });
                 }
             }
             if !eligible {
@@ -113,6 +132,32 @@ mod tests {
             p1.lane_idx, p2.lane_idx,
             "second should spill to the other lane"
         );
+    }
+
+    #[tokio::test]
+    async fn affinity_pins_a_session_to_one_lane_then_spills_when_full() {
+        let pool = Pool::with_window(vec![spec("a", 2), spec("b", 2)], Duration::from_secs(60));
+        let d = Dispatcher::new(handle(pool));
+        let s = Some(0xBEEFu64);
+        let first = d.acquire_for(None, &[], s).await.unwrap().lane_idx;
+        let second = d.acquire_for(None, &[], s).await.unwrap().lane_idx;
+        assert_eq!(first, second, "a session should stay on its own lane");
+        // That lane is now at its rpm of 2, so the third has to spill.
+        let third = d.acquire_for(None, &[], s).await.unwrap().lane_idx;
+        assert_ne!(third, first, "a full affinity lane must spill, not block");
+    }
+
+    #[tokio::test]
+    async fn spillover_spreads_across_lanes_instead_of_filling_the_first() {
+        // Both lanes have room throughout, so a first-fit scan would put every
+        // request on lane 0 and leave key 1 idle. Least-loaded alternates.
+        let pool = Pool::with_window(vec![spec("a", 3), spec("b", 3)], Duration::from_secs(60));
+        let d = Dispatcher::new(handle(pool));
+        let mut on_lane = [0usize; 2];
+        for _ in 0..4 {
+            on_lane[d.acquire().await.lane_idx] += 1;
+        }
+        assert_eq!(on_lane, [2, 2], "load should spread, not fill lane 0 first");
     }
 
     #[tokio::test]

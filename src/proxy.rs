@@ -3,6 +3,7 @@
 //! model, forwarding, and failing over on retryable errors. Buffered and streaming
 //! (SSE, with heartbeats) responses share the same planning + failover logic.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -123,6 +124,25 @@ fn requested_model(body: &Bytes) -> Option<String> {
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
 }
 
+/// Conversation identity for sticky routing: the model plus the opening messages.
+/// An agent session appends to its transcript every turn but never rewrites the
+/// head, so hashing the head yields the same value each turn while the tail grows
+/// — which is exactly the prefix the upstream would have cached. `None` for
+/// requests with no `messages` array, which carry no conversation to pin.
+fn session_key(body: &Bytes) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let messages = v.get("messages")?.as_array()?;
+    let mut h = DefaultHasher::new();
+    v.get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .hash(&mut h);
+    for msg in messages.iter().take(2) {
+        msg.to_string().hash(&mut h);
+    }
+    Some(h.finish())
+}
+
 /// Return `body` with its `model` field replaced, or unchanged if there's no
 /// override or the body isn't a JSON object.
 fn rewrite_model(body: &Bytes, model: Option<&str>) -> Bytes {
@@ -227,6 +247,7 @@ pub async fn handle(
     let aliases = { state.store.lock().unwrap().aliases.clone() };
     let requested = requested_model(&body);
     let model_label = requested.clone().unwrap_or_else(|| "unknown".to_string());
+    let session = session_key(&body);
 
     // Streaming: commit 200 text/event-stream now and drive the request in a worker
     // that heartbeats while it paces/retries, then relays the upstream SSE body.
@@ -242,6 +263,7 @@ pub async fn handle(
             aliases,
             client,
             model_label,
+            session,
             tx,
         ));
         return (
@@ -263,7 +285,7 @@ pub async fn handle(
             deadline,
             state
                 .dispatch
-                .acquire_for(step.provider.as_deref(), &excluded),
+                .acquire_for(step.provider.as_deref(), &excluded, session),
         )
         .await
         {
@@ -383,10 +405,11 @@ async fn acquire_for_heartbeating(
     state: &Arc<AppState>,
     provider: Option<&str>,
     excluded: &[usize],
+    session: Option<u64>,
     deadline: Option<Instant>,
     tx: &Tx,
 ) -> Result<Option<Permit>, ()> {
-    let acq = state.dispatch.acquire_for(provider, excluded);
+    let acq = state.dispatch.acquire_for(provider, excluded, session);
     tokio::pin!(acq);
     loop {
         let beat = tokio::time::sleep(HEARTBEAT);
@@ -425,6 +448,7 @@ async fn stream_proxy(
     aliases: Vec<Alias>,
     client: String,
     model: String,
+    session: Option<u64>,
     tx: Tx,
 ) {
     // Immediate heartbeat so the client sees the stream is live right away.
@@ -441,6 +465,7 @@ async fn stream_proxy(
             &state,
             step.provider.as_deref(),
             &excluded,
+            session,
             deadline,
             &tx,
         )

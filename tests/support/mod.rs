@@ -202,6 +202,32 @@ pub async fn start_echo_mock() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// A mock provider that reports which API key served the request, so a test can
+/// observe routing decisions (affinity, spillover) instead of inferring them.
+pub async fn start_key_reporting_mock() -> String {
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(|headers: axum::http::HeaderMap| async move {
+            let key = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .trim_start_matches("Bearer ")
+                .to_string();
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                format!(r#"{{"served_by":"{key}"}}"#),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
 /// A mock provider that waits `delay` before answering — used to trip deadlines.
 pub async fn start_slow_mock(delay: Duration) -> String {
     let app = axum::Router::new().route(

@@ -4,6 +4,7 @@
 //! token bucket.
 
 use std::collections::VecDeque;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -33,9 +34,7 @@ impl SlidingWindow {
         }
     }
 
-    /// Grant a slot at `now`, or report when the next slot frees.
-    /// `Ok(())` records a hit and grants; `Err(retry_at)` means saturated.
-    pub fn try_acquire(&mut self, now: Instant) -> Result<(), Instant> {
+    fn prune(&mut self, now: Instant) {
         let cutoff = now.checked_sub(self.window);
         while let Some(&front) = self.hits.front() {
             match cutoff {
@@ -45,6 +44,18 @@ impl SlidingWindow {
                 _ => break,
             }
         }
+    }
+
+    /// Hits still inside the window — how much of this key's budget is spent.
+    pub fn load(&mut self, now: Instant) -> usize {
+        self.prune(now);
+        self.hits.len()
+    }
+
+    /// Grant a slot at `now`, or report when the next slot frees.
+    /// `Ok(())` records a hit and grants; `Err(retry_at)` means saturated.
+    pub fn try_acquire(&mut self, now: Instant) -> Result<(), Instant> {
+        self.prune(now);
         if self.hits.len() < self.limit {
             self.hits.push_back(now);
             Ok(())
@@ -80,6 +91,11 @@ impl Lane {
 
     pub fn try_acquire(&self, now: Instant) -> Result<(), Instant> {
         self.limiter.lock().unwrap().try_acquire(now)
+    }
+
+    /// Spent budget in the current window, for picking the least-loaded lane.
+    pub fn load(&self, now: Instant) -> usize {
+        self.limiter.lock().unwrap().load(now)
     }
 }
 
@@ -152,6 +168,41 @@ impl Pool {
     pub fn lanes(&self) -> &[Lane] {
         &self.lanes
     }
+
+    /// Sticky-lane hint: rendezvous (highest-random-weight) hash, so the lane
+    /// maximizing `hash(session, lane identity)` wins. Pinning a conversation to
+    /// one key keeps any upstream prefix cache warm across its turns.
+    ///
+    /// Weighting by the lane's *identity* rather than its index is what makes
+    /// this survive pool changes: reordering lanes moves nothing, and adding or
+    /// removing a key relocates only that key's share of conversations. Plain
+    /// `hash % lanes` would remap nearly every conversation on any size change
+    /// and dump every warm cache at once.
+    ///
+    /// Purely an optimization — correctness never depends on which key serves a
+    /// request, so callers are free to spill elsewhere when this lane is full.
+    pub fn affinity_lane(&self, session: u64) -> Option<usize> {
+        self.affinity_among(session, 0..self.lanes.len())
+    }
+
+    /// Affinity restricted to `candidates`. Routing may narrow the eligible set
+    /// to one provider or exclude lanes that already failed this request, and a
+    /// conversation should stick within whatever set actually remains rather
+    /// than losing its lane entirely.
+    pub fn affinity_among(
+        &self,
+        session: u64,
+        candidates: impl Iterator<Item = usize>,
+    ) -> Option<usize> {
+        candidates.max_by_key(|&i| {
+            let lane = &self.lanes[i];
+            let mut h = DefaultHasher::new();
+            session.hash(&mut h);
+            lane.provider.hash(&mut h);
+            lane.key.hash(&mut h);
+            h.finish()
+        })
+    }
 }
 
 /// A hot-swappable pool handle: settings can replace the pool without a restart.
@@ -219,5 +270,80 @@ mod tests {
         assert_eq!(lane.base_url, "http://nim.test");
         assert_eq!(lane.key, "nim-key");
         assert!(lane.try_acquire(Instant::now()).is_ok());
+    }
+
+    fn specs(n: usize) -> Vec<LaneSpec> {
+        (0..n)
+            .map(|i| LaneSpec {
+                provider: "nim".into(),
+                base_url: "http://nim.test".into(),
+                key: format!("key-{i}"),
+                rpm: 40,
+            })
+            .collect()
+    }
+
+    fn key_for(pool: &Pool, session: u64) -> String {
+        pool.lanes()[pool.affinity_lane(session).unwrap()]
+            .key
+            .clone()
+    }
+
+    #[test]
+    fn affinity_is_stable_for_the_same_session() {
+        let pool = Pool::new(specs(5));
+        let first = pool.affinity_lane(0x00C0FFEE).unwrap();
+        for _ in 0..10 {
+            assert_eq!(pool.affinity_lane(0x00C0FFEE), Some(first));
+        }
+    }
+
+    #[test]
+    fn affinity_spreads_sessions_over_every_lane() {
+        let pool = Pool::new(specs(4));
+        let mut hit = std::collections::HashSet::new();
+        for s in 0..500u64 {
+            hit.insert(pool.affinity_lane(s).unwrap());
+        }
+        assert_eq!(hit.len(), 4, "every lane should attract some sessions");
+    }
+
+    #[test]
+    fn affinity_on_an_empty_pool_is_none() {
+        assert_eq!(Pool::new(vec![]).affinity_lane(1), None);
+    }
+
+    /// The reason for rendezvous hashing over `hash % lanes`: adding a key must
+    /// relocate only the new lane's share of conversations, not nearly all of
+    /// them. Modulo would move ~5/6 here and dump every warm prefix cache at once.
+    #[test]
+    fn growing_the_pool_relocates_only_the_new_lanes_share() {
+        let before = Pool::new(specs(5));
+        let after = Pool::new(specs(6));
+        let moved = (0..1200u64)
+            .filter(|&s| key_for(&before, s) != key_for(&after, s))
+            .count();
+        assert!(
+            moved < 300,
+            "relocated {moved}/1200 sessions; expected ~1/6 (200)"
+        );
+    }
+
+    /// Affinity is keyed on lane identity, not lane index, so a pool rebuild that
+    /// reorders lanes (disabling a key, adding a provider) keeps every
+    /// conversation on the key it was already warm on.
+    #[test]
+    fn reordering_lanes_relocates_nothing() {
+        let pool = Pool::new(specs(4));
+        let mut reordered = specs(4);
+        reordered.reverse();
+        let shuffled = Pool::new(reordered);
+        for s in 0..300u64 {
+            assert_eq!(
+                key_for(&pool, s),
+                key_for(&shuffled, s),
+                "session {s} moved when only lane order changed"
+            );
+        }
     }
 }

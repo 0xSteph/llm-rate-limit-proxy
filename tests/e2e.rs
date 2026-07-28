@@ -187,6 +187,77 @@ async fn fails_over_from_bad_key_to_good_key() {
     assert!(r.text().await.unwrap().contains("\"mock\":\"ok\""));
 }
 
+async fn served_by(s: &Server, secret: &str, body: String) -> String {
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {secret}"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    v["served_by"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn a_conversation_keeps_one_key_as_its_transcript_grows() {
+    use sluice::auth::{hash_password, new_client_key};
+    use sluice::config::{Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION};
+
+    let mock = support::start_key_reporting_mock().await;
+    let (client_secret, client_rec) = new_client_key("test", "admin");
+    let store = StoredConfig {
+        version: STORE_VERSION,
+        users: vec![User {
+            username: "admin".into(),
+            pw_hash: hash_password("password123"),
+            role: Role::Superuser,
+        }],
+        providers: vec![Provider {
+            name: "mock".into(),
+            base_url: mock.clone(),
+            keys: (0..4)
+                .map(|i| ProviderKey {
+                    key: format!("key-{i}"),
+                    enabled: true,
+                    rpm: 40,
+                    owner: "admin".into(),
+                })
+                .collect(),
+        }],
+        clients: vec![client_rec],
+        aliases: vec![],
+        settings: Default::default(),
+    };
+    let s = Server::start_seeded(&store, &[]).await;
+
+    // The opening messages are byte-identical every turn; only the tail grows.
+    let opening =
+        r#"{"role":"system","content":"you are a bot"},{"role":"user","content":"hello"}"#;
+    let first = served_by(
+        &s,
+        &client_secret,
+        format!(r#"{{"model":"m","messages":[{opening}]}}"#),
+    )
+    .await;
+    let later = served_by(
+        &s,
+        &client_secret,
+        format!(
+            r#"{{"model":"m","messages":[{opening},{{"role":"assistant","content":"hi"}},{{"role":"user","content":"more"}}]}}"#
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        first, later,
+        "a conversation must keep its key across turns to hold the prefix cache"
+    );
+}
+
 #[tokio::test]
 async fn deadline_exceeded_returns_504() {
     let mock = support::start_slow_mock(Duration::from_secs(3)).await;
