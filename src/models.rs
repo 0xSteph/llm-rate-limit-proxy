@@ -51,6 +51,28 @@ impl Catalog {
         Some(self.entries.lock().unwrap().get(provider)?.models.clone())
     }
 
+    /// Which providers list `model` in their catalog, sorted for a stable plan.
+    ///
+    /// Routing a model to a provider that doesn't serve it spends a rate slot to
+    /// earn a 404, then fails over — so with more than one provider configured
+    /// the catalog is the difference between one clean call and a tour of every
+    /// key you own.
+    pub fn providers_offering(&self, model: &str) -> Vec<String> {
+        let entries = self.entries.lock().unwrap();
+        let mut names: Vec<String> = entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .models
+                    .iter()
+                    .any(|m| m.get("id").and_then(|i| i.as_str()) == Some(model))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     pub fn put(&self, provider: &str, models: Vec<Value>, now: Instant) {
         self.entries.lock().unwrap().insert(
             provider.to_string(),
@@ -182,6 +204,17 @@ mod tests {
         cat.put("nim", vec![model("a")], start);
         assert!(cat.fresh("nim", start + Duration::from_secs(59)).is_some());
         assert!(cat.fresh("nim", start + Duration::from_secs(61)).is_none());
+    }
+
+    #[test]
+    fn providers_offering_names_only_those_that_list_the_model() {
+        let cat = Catalog::new(Duration::from_secs(60));
+        let now = Instant::now();
+        cat.put("nim", vec![model("shared"), model("nim-only")], now);
+        cat.put("together", vec![model("shared")], now);
+        assert_eq!(cat.providers_offering("shared"), vec!["nim", "together"]);
+        assert_eq!(cat.providers_offering("nim-only"), vec!["nim"]);
+        assert!(cat.providers_offering("nowhere").is_empty());
     }
 
     #[test]

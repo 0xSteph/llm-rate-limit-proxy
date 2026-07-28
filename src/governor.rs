@@ -86,11 +86,23 @@ impl Governor {
         if state.implicated_keys() >= KEYS_TO_INDICT {
             let observed = state.inflight.max(1);
             let backed_off = (observed / 2).max(1);
+            let was = state.limit;
             state.limit = if state.limit == 0 {
                 backed_off
             } else {
                 state.limit.min(backed_off)
             };
+            if state.limit != was {
+                // The one moment worth announcing: from here requests wait on a
+                // gate that consumes no rate budget, so every rate figure will
+                // read low while the proxy is in fact working as hard as allowed.
+                println!(
+                    "  governing {model} at {} concurrent ({} keys rebuffed, {} in flight)",
+                    state.limit,
+                    state.implicated_keys(),
+                    observed
+                );
+            }
         }
     }
 

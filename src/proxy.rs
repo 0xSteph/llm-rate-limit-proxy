@@ -206,11 +206,19 @@ const DEFAULT_BENCH: Duration = Duration::from_secs(5);
 /// Take the rebuffed lane out of rotation for as long as the provider asked, or
 /// a short default. A key that just answered 429 will answer the same way to the
 /// next request, so without this every request pays to rediscover it.
-fn bench_lane(state: &AppState, lane_idx: usize, headers: &HeaderMap) {
+fn bench_lane(state: &AppState, lane_idx: usize, model: &str, status: u16, headers: &HeaderMap) {
     let cooldown = retry_after(headers).unwrap_or(DEFAULT_BENCH);
     let pool = state.pool.read().unwrap().clone();
     if let Some(lane) = pool.lanes().get(lane_idx) {
         lane.bench(Instant::now() + cooldown);
+        // Retries are invisible in the access log, which only records how a
+        // request finally ended. Without this line an operator can see that the
+        // governor engaged but has no way to count the pushback behind it.
+        println!(
+            "  retry {status} {} key#{lane_idx} {model} (benched {}s)",
+            lane.provider,
+            cooldown.as_secs()
+        );
     }
 }
 
@@ -226,7 +234,12 @@ struct PlanStep {
 /// Resolve the requested model to an ordered plan. An alias expands to its fallback
 /// targets; a plain model becomes up to a few "any lane, unchanged model" steps so
 /// key-level failover still applies.
-fn resolve_plan(model: Option<&str>, aliases: &[Alias], pool_len: usize) -> Vec<PlanStep> {
+fn resolve_plan(
+    model: Option<&str>,
+    aliases: &[Alias],
+    pool_len: usize,
+    offering: &[String],
+) -> Vec<PlanStep> {
     if let Some(name) = model {
         if let Some(alias) = aliases.iter().find(|a| a.name == name) {
             return alias
@@ -239,12 +252,25 @@ fn resolve_plan(model: Option<&str>, aliases: &[Alias], pool_len: usize) -> Vec<
                 .collect();
         }
     }
-    (0..pool_len.clamp(1, 4))
-        .map(|_| PlanStep {
-            provider: None,
+    // Try the providers whose catalog actually lists this model first. Sending it
+    // to one that doesn't spends a rate slot to earn a 404 and then fails over,
+    // so with several providers configured this is the difference between one
+    // clean call and a tour of every key.
+    let mut steps: Vec<PlanStep> = offering
+        .iter()
+        .map(|p| PlanStep {
+            provider: Some(p.clone()),
             model: None,
         })
-        .collect()
+        .collect();
+    // Always keep at least one unrestricted attempt: a catalog can be stale, or
+    // never fetched at all, and being wrong about that must not strand a request.
+    let anywhere = pool_len.clamp(1, 4).saturating_sub(steps.len()).max(1);
+    steps.extend((0..anywhere).map(|_| PlanStep {
+        provider: None,
+        model: None,
+    }));
+    steps
 }
 
 fn requested_model(body: &Bytes) -> Option<String> {
@@ -520,7 +546,8 @@ pub async fn handle(
 
     // Buffered path: walk the plan, failing over on retryable errors.
     let pool_len = state.pool.read().unwrap().len();
-    let plan = resolve_plan(requested.as_deref(), &aliases, pool_len);
+    let offering = state.catalog.providers_offering(&model_label);
+    let plan = resolve_plan(requested.as_deref(), &aliases, pool_len, &offering);
     let last = plan.len().saturating_sub(1);
     let mut excluded: Vec<usize> = Vec::new();
     for (i, step) in plan.iter().enumerate() {
@@ -570,7 +597,13 @@ pub async fn handle(
                 if is_retryable(resp.status().as_u16()) {
                     // Bench even on the last step: this request is out of options,
                     // but the next one shouldn't walk into the same wall.
-                    bench_lane(&state, permit.lane_idx, resp.headers());
+                    bench_lane(
+                        &state,
+                        permit.lane_idx,
+                        step_model,
+                        resp.status().as_u16(),
+                        resp.headers(),
+                    );
                     state
                         .governor
                         .note_rebuff(step_model, permit.lane_idx, Instant::now());
@@ -727,7 +760,13 @@ async fn stream_proxy(
         return;
     }
     let pool_len = state.pool.read().unwrap().len();
-    let plan = resolve_plan(requested_model(&body).as_deref(), &aliases, pool_len);
+    let offering = state.catalog.providers_offering(&model);
+    let plan = resolve_plan(
+        requested_model(&body).as_deref(),
+        &aliases,
+        pool_len,
+        &offering,
+    );
     let last = plan.len().saturating_sub(1);
     let mut excluded: Vec<usize> = Vec::new();
     let mut retried_plain = false;
@@ -794,7 +833,13 @@ async fn stream_proxy(
         match sent {
             Ok(resp) => {
                 if is_retryable(resp.status().as_u16()) {
-                    bench_lane(&state, permit.lane_idx, resp.headers());
+                    bench_lane(
+                        &state,
+                        permit.lane_idx,
+                        step_model,
+                        resp.status().as_u16(),
+                        resp.headers(),
+                    );
                     state
                         .governor
                         .note_rebuff(step_model, permit.lane_idx, Instant::now());
@@ -923,6 +968,41 @@ mod tests {
     #[test]
     fn a_similar_looking_segment_is_not_treated_as_a_duplicate() {
         assert_eq!(normalize_path("/v1/v1beta/x"), "/v1/v1beta/x");
+    }
+
+    fn providers_of(plan: &[PlanStep]) -> Vec<Option<&str>> {
+        plan.iter().map(|s| s.provider.as_deref()).collect()
+    }
+
+    #[test]
+    fn a_plain_model_prefers_providers_that_actually_list_it() {
+        let plan = resolve_plan(Some("m"), &[], 4, &["together".to_string()]);
+        assert_eq!(providers_of(&plan)[0], Some("together"));
+        assert!(
+            plan.iter().any(|s| s.provider.is_none()),
+            "a stale catalog must not strand the request"
+        );
+    }
+
+    #[test]
+    fn with_no_catalog_knowledge_every_step_is_unrestricted() {
+        let plan = resolve_plan(Some("m"), &[], 3, &[]);
+        assert_eq!(providers_of(&plan), vec![None, None, None]);
+    }
+
+    /// An alias is an explicit instruction about where to route; catalog contents
+    /// are an inference. The explicit one wins.
+    #[test]
+    fn an_alias_still_overrides_catalog_preference() {
+        let alias = Alias {
+            name: "virtual".into(),
+            targets: vec![crate::config::AliasTarget {
+                provider: "chosen".into(),
+                model: "real".into(),
+            }],
+        };
+        let plan = resolve_plan(Some("virtual"), &[alias], 4, &["other".to_string()]);
+        assert_eq!(providers_of(&plan), vec![Some("chosen")]);
     }
 
     #[test]
