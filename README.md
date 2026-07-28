@@ -55,7 +55,8 @@ already have.
 **Operations**
 
 - Setup wizard, session auth, client API keys stored only as digests
-- Runtime settings: add keys, mint client keys, adjust limits — no restart
+- Runtime settings, all live with no restart: providers, provider keys, client
+  keys, virtual models, operator accounts, and limits
 - Content-blind metrics (counts, sizes, latencies — never message content),
   persisted snapshots for range views, and a dashboard
 - `/api/pressure` reports models held back by provider-side limits, so a stalled
@@ -92,6 +93,7 @@ cargo test --test load -- --ignored   # 100 concurrent clients, asserts zero
 
 ## Status
 
-Working and tested, not yet packaged. No Docker image, no TLS termination (put a
-reverse proxy in front for anything exposed), and user management and the alias
-editor are reachable through the config store but have no UI yet.
+Working and tested, not yet packaged. No Docker image and no TLS termination —
+put a reverse proxy in front for anything exposed. The settings API is complete;
+the dashboard renders observability but not yet forms for every settings route,
+so some changes are a `POST` rather than a click.

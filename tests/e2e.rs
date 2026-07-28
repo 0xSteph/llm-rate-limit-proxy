@@ -851,6 +851,59 @@ async fn removing_a_provider_prunes_aliases_that_pointed_at_it() {
 }
 
 #[tokio::test]
+async fn an_added_user_can_log_in_and_the_superuser_cannot_be_deleted() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "main", &mock, "k1")
+        .await;
+    s.login("admin", "password123").await;
+
+    let r = settings_post(
+        &s,
+        "/api/settings/users",
+        serde_json::json!({"action": "add", "username": "friend", "password": "correcthorsebattery"}),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+
+    let r = settings_post(
+        &s,
+        "/api/settings/users",
+        serde_json::json!({"action": "remove", "username": "admin"}),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        400,
+        "deleting the superuser locks everyone out of a running proxy"
+    );
+
+    s.logout().await;
+    assert_eq!(
+        s.login("friend", "correcthorsebattery").await.status(),
+        303,
+        "a user added through settings must be able to sign in"
+    );
+}
+
+#[tokio::test]
+async fn a_short_password_is_refused() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "main", &mock, "k1")
+        .await;
+    s.login("admin", "password123").await;
+
+    let r = settings_post(
+        &s,
+        "/api/settings/users",
+        serde_json::json!({"action": "add", "username": "weak", "password": "short"}),
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+}
+
+#[tokio::test]
 async fn settings_are_closed_to_anonymous_callers() {
     let mock = support::start_mock_upstream().await;
     let s = Server::start().await;

@@ -69,6 +69,10 @@ pub async fn view(State(state): State<Arc<AppState>>) -> Json<serde_json::Value>
             "owner": c.owner,
         })).collect::<Vec<_>>(),
         "aliases": store.aliases,
+        "users": store.users.iter().map(|u| json!({
+            "username": u.username,
+            "role": u.role,
+        })).collect::<Vec<_>>(),
         "settings": store.settings,
     }))
 }
@@ -401,6 +405,96 @@ pub async fn clients(
         )
             .into_response(),
         None => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum UserAction {
+    Add {
+        username: String,
+        password: String,
+        admin: Option<bool>,
+    },
+    Remove {
+        username: String,
+    },
+    SetPassword {
+        username: String,
+        password: String,
+    },
+}
+
+/// Shortest password accepted. Long enough to be worth the PBKDF2 work factor,
+/// short enough not to push anyone toward reuse.
+const MIN_PASSWORD: usize = 10;
+
+/// Add, remove, or re-password an operator account.
+///
+/// The superuser cannot be removed. It is the account that always exists, so
+/// deleting it is the one mistake that locks everybody out of a running proxy
+/// with no way back in short of editing the store on disk.
+pub async fn users(State(state): State<Arc<AppState>>, Json(action): Json<UserAction>) -> Response {
+    let snapshot = {
+        let mut store = state.store.lock().unwrap();
+        match action {
+            UserAction::Add {
+                username,
+                password,
+                admin,
+            } => {
+                let username = username.trim().to_string();
+                if username.is_empty() {
+                    return bad_request("username must not be empty");
+                }
+                if password.chars().count() < MIN_PASSWORD {
+                    return bad_request(&format!(
+                        "password must be at least {MIN_PASSWORD} characters"
+                    ));
+                }
+                if store.users.iter().any(|u| u.username == username) {
+                    return bad_request("that username is taken");
+                }
+                store.users.push(config::User {
+                    username,
+                    pw_hash: auth::hash_password(&password),
+                    role: if admin.unwrap_or(false) {
+                        config::Role::Admin
+                    } else {
+                        config::Role::User
+                    },
+                });
+            }
+            UserAction::Remove { username } => {
+                let Some(user) = store.users.iter().find(|u| u.username == username) else {
+                    return bad_request("no user by that name");
+                };
+                if user.role == config::Role::Superuser {
+                    return bad_request("the superuser cannot be removed");
+                }
+                store.users.retain(|u| u.username != username);
+            }
+            UserAction::SetPassword { username, password } => {
+                if password.chars().count() < MIN_PASSWORD {
+                    return bad_request(&format!(
+                        "password must be at least {MIN_PASSWORD} characters"
+                    ));
+                }
+                let Some(user) = store.users.iter_mut().find(|u| u.username == username) else {
+                    return bad_request("no user by that name");
+                };
+                user.pw_hash = auth::hash_password(&password);
+            }
+        }
+        store.clone()
+    };
+    match config::save(&state.data_dir, &snapshot) {
+        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": {"message": e, "code": "save_failed"}})),
+        )
+            .into_response(),
     }
 }
 

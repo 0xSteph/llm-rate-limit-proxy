@@ -284,6 +284,7 @@ pub async fn run() {
         .route("/api/settings/aliases", post(settings::aliases))
         .route("/api/settings/clients", post(settings::clients))
         .route("/api/settings/limits", post(settings::limits))
+        .route("/api/settings/users", post(settings::users))
         .route("/dash/config.json", get(dash_config))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
