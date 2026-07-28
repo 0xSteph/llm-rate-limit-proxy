@@ -9,7 +9,7 @@ pub mod proxy;
 pub mod setup;
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -38,6 +38,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// The provider's real rate window; the pool enforces over this plus a margin.
     pub provider_window: Duration,
+    /// Requests currently in flight, bounded by `settings.max_inflight`.
+    pub inflight: Arc<AtomicUsize>,
     /// Content-blind request metrics (counts by client/model/status).
     pub metrics: metrics::Metrics,
     /// Persisted 5-minute snapshots for range views.
@@ -218,6 +220,7 @@ pub async fn run() {
         admin: auth::Admin::new(trust_proxy),
         started: unix_now(),
         dispatch: dispatch::Dispatcher::new(pool.clone()),
+        inflight: Arc::new(AtomicUsize::new(0)),
         pool,
         http,
         provider_window,

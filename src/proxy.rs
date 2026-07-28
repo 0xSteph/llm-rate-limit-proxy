@@ -4,7 +4,7 @@
 //! (SSE, with heartbeats) responses share the same planning + failover logic.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,20 @@ async fn with_deadline<F: std::future::Future>(
     }
 }
 
+/// Shed response. Carries `Retry-After` so a shed client backs off instead of
+/// hammering, and a distinct code so this is diagnosable apart from the other
+/// 503s. The configured cap is deliberately not disclosed to callers.
+fn overloaded() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        Json(serde_json::json!({
+            "error": {"message": "proxy at capacity; retry shortly", "code": "overloaded"}
+        })),
+    )
+        .into_response()
+}
+
 fn deadline_exceeded() -> Response {
     err(
         StatusCode::GATEWAY_TIMEOUT,
@@ -97,6 +111,30 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let raw = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
     let secs: u64 = raw.trim().parse().ok()?;
     Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+}
+
+/// Holds one concurrency slot, releasing it on drop so a request frees its slot
+/// however it ends — success, error, deadline, or the client hanging up mid-stream
+/// — without every exit path having to remember.
+pub struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Claim a concurrency slot, or `None` when the proxy is already at `max`.
+///
+/// The slot is claimed first and handed back on refusal, so the check is a single
+/// atomic and concurrent callers can never both observe room and overshoot the cap
+/// the way a separate load-then-increment can.
+pub fn try_admit(counter: &Arc<AtomicUsize>, max: usize) -> Option<InflightGuard> {
+    if counter.fetch_add(1, Ordering::Relaxed) >= max {
+        counter.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(InflightGuard(counter.clone()))
 }
 
 /// Cooldown for a lane the provider rebuffed without saying for how long.
@@ -252,6 +290,14 @@ pub async fn handle(
         );
     }
 
+    // Shed before parsing: an agent transcript is a large body and the paths below
+    // walk it more than once, so a flood must be turned away before that cost is
+    // paid. The guard rides the whole request and frees its slot on drop.
+    let max_inflight = { state.store.lock().unwrap().settings.max_inflight };
+    let Some(inflight) = try_admit(&state.inflight, max_inflight) else {
+        return overloaded();
+    };
+
     // Common request shape for both paths.
     let deadline = parse_deadline(&headers);
     let path_query = uri
@@ -292,6 +338,7 @@ pub async fn handle(
             client,
             model_label,
             session,
+            inflight,
             tx,
         ));
         return (
@@ -482,6 +529,9 @@ async fn stream_proxy(
     client: String,
     model: String,
     session: Option<u64>,
+    // Held for the life of the stream so `max_inflight` bounds live streams too,
+    // not just the brief window before the response is committed.
+    _inflight: InflightGuard,
     tx: Tx,
 ) {
     // Immediate heartbeat so the client sees the stream is live right away.
@@ -591,6 +641,30 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(header::RETRY_AFTER, HeaderValue::from_str(v).unwrap());
         h
+    }
+
+    #[test]
+    fn admission_stops_at_the_cap_and_frees_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first = try_admit(&counter, 2).expect("first admitted");
+        let second = try_admit(&counter, 2).expect("second admitted");
+        assert!(try_admit(&counter, 2).is_none(), "third exceeds the cap");
+        drop(first);
+        assert!(try_admit(&counter, 2).is_some(), "a freed slot is reusable");
+        drop(second);
+    }
+
+    /// The counter is claimed before the cap is checked, so a refusal has to put
+    /// it back — otherwise every shed permanently shrinks the pool by one and the
+    /// proxy strangles itself under exactly the load the cap exists to survive.
+    #[test]
+    fn refused_admissions_do_not_leak_slots() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let _held = try_admit(&counter, 1).expect("first admitted");
+        for _ in 0..5 {
+            assert!(try_admit(&counter, 1).is_none());
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
     #[test]

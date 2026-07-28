@@ -108,16 +108,26 @@ fn default_rpm() -> usize {
 pub struct Settings {
     #[serde(default = "default_history_days")]
     pub history_days: u32,
+    #[serde(default = "default_max_inflight")]
+    pub max_inflight: usize,
 }
 
 fn default_history_days() -> u32 {
     30
 }
 
+/// Concurrent requests admitted before the proxy sheds. High enough that normal
+/// agent fleets never see it; low enough that a runaway client can't exhaust
+/// sockets and memory before anything else notices.
+fn default_max_inflight() -> usize {
+    512
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             history_days: default_history_days(),
+            max_inflight: default_max_inflight(),
         }
     }
 }

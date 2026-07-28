@@ -314,6 +314,74 @@ async fn a_rate_limited_key_is_benched_so_the_next_request_skips_it() {
 }
 
 #[tokio::test]
+async fn requests_past_the_concurrency_cap_are_shed_with_retry_after() {
+    use sluice::auth::{hash_password, new_client_key};
+    use sluice::config::{
+        Provider, ProviderKey, Role, Settings, StoredConfig, User, STORE_VERSION,
+    };
+
+    let mock = support::start_slow_mock(Duration::from_secs(2)).await;
+    let (client_secret, client_rec) = new_client_key("test", "admin");
+    let store = StoredConfig {
+        version: STORE_VERSION,
+        users: vec![User {
+            username: "admin".into(),
+            pw_hash: hash_password("password123"),
+            role: Role::Superuser,
+        }],
+        providers: vec![Provider {
+            name: "mock".into(),
+            base_url: mock.clone(),
+            keys: vec![ProviderKey {
+                key: "k".into(),
+                enabled: true,
+                rpm: 40,
+                owner: "admin".into(),
+            }],
+        }],
+        clients: vec![client_rec],
+        aliases: vec![],
+        settings: Settings {
+            max_inflight: 1,
+            ..Default::default()
+        },
+    };
+    let s = Server::start_seeded(&store, &[]).await;
+
+    // The first request holds the only slot for ~2s against the slow upstream.
+    let (c, url, secret) = (s.client.clone(), s.base_url.clone(), client_secret.clone());
+    let held = tokio::spawn(async move {
+        c.post(format!("{url}/v1/chat/completions"))
+            .header("authorization", format!("Bearer {secret}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let shed = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {client_secret}"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(shed.status(), 503);
+    assert_eq!(
+        shed.headers()["retry-after"],
+        "1",
+        "a shed client needs to be told to back off, not left to hammer"
+    );
+    let body: serde_json::Value = shed.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "overloaded");
+
+    held.await.unwrap();
+}
+
+#[tokio::test]
 async fn deadline_exceeded_returns_504() {
     let mock = support::start_slow_mock(Duration::from_secs(3)).await;
     let s = Server::start().await;
