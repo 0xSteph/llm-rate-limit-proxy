@@ -4,19 +4,23 @@
 <title>Sluice · console</title>
 <style>
   :root {
-    --bg: #080b12;
-    --panel: #0e1420;
-    --panel-2: #121a29;
-    --line: #1d2839;
-    --ink: #d5deec;
-    --dim: #6a7a91;
-    --accent: #35e0c4;
-    --accent-dim: #1c6f64;
-    --ok: #4ade80;
-    --warn: #f5b544;
-    --err: #f8726a;
-    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "Cascadia Code",
-      "Roboto Mono", Consolas, monospace;
+    /* Instrument panel, not a storefront: near-black chassis, hairline rules,
+       one signal colour used sparingly so it still means something. */
+    --bg:      #07080a;
+    --panel:   #0d0f12;
+    --panel-2: #111419;
+    --line:    #1b1f26;
+    --line-2:  #262c35;
+    --ink:     #c6ccd4;
+    --ink-2:   #8b939e;
+    --dim:     #5a626d;
+    --accent:  #f0883e;
+    --accent-d:#7a4a22;
+    --ok:      #5bbf7a;
+    --warn:    #e0a83c;
+    --err:     #e0574f;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "DejaVu Sans Mono",
+      "Cascadia Mono", Consolas, monospace;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
@@ -24,96 +28,148 @@
     background: var(--bg);
     color: var(--ink);
     font-family: var(--mono);
-    font-size: 13px;
-    line-height: 1.5;
+    font-size: 12px;
+    line-height: 1.45;
     -webkit-font-smoothing: antialiased;
-    background-image:
-      linear-gradient(var(--line) 1px, transparent 1px),
-      linear-gradient(90deg, var(--line) 1px, transparent 1px);
-    background-size: 44px 44px;
-    background-position: -1px -1px;
   }
-  body::before {
+  /* Scanline texture — the only decoration, and it reads as a CRT rather than
+     as branding. Fixed so it never scrolls with content. */
+  body::after {
     content: "";
-    position: fixed; inset: 0; pointer-events: none;
-    background: radial-gradient(120% 80% at 50% -10%, rgba(53, 224, 196, 0.07), transparent 60%);
+    position: fixed; inset: 0; pointer-events: none; z-index: 99;
+    background: repeating-linear-gradient(
+      180deg, rgba(255,255,255,.014) 0 1px, transparent 1px 3px);
   }
   a { color: var(--accent); text-decoration: none; }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 22px 20px 60px; position: relative; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 0 16px 48px; }
 
+  /* --- status bar ------------------------------------------------------- */
   header {
-    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
-    border-bottom: 1px solid var(--line); padding-bottom: 14px;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    border-bottom: 1px solid var(--line-2);
+    padding: 9px 0; margin-bottom: 14px;
   }
-  .mark { font-size: 20px; letter-spacing: 0.42em; font-weight: 700; color: var(--ink); text-transform: uppercase; }
-  .mark b { color: var(--accent); }
-  .tag { color: var(--dim); font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; }
-  .strip { margin-left: auto; display: flex; gap: 20px; flex-wrap: wrap; }
-  .strip div { color: var(--dim); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
-  .strip b { display: block; color: var(--ink); font-size: 15px; letter-spacing: 0; text-transform: none; }
-  .live { color: var(--accent); }
-  .live::before { content: "● "; animation: pulse 2s infinite; }
-  @keyframes pulse { 50% { opacity: 0.35; } }
+  .mark {
+    font-size: 12px; font-weight: 700; color: var(--ink);
+    letter-spacing: 0; text-transform: none;
+  }
+  .mark b { color: var(--accent); font-weight: 700; }
+  .tag { color: var(--dim); font-size: 11px; letter-spacing: 0; text-transform: none; }
+  .strip { margin-left: auto; display: flex; gap: 0; flex-wrap: wrap; }
+  .strip div {
+    color: var(--dim); font-size: 11px; text-transform: none; letter-spacing: 0;
+    padding: 0 12px; border-left: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 6px;
+  }
+  .strip div:first-child { border-left: 0; }
+  .strip b {
+    display: inline; color: var(--ink); font-size: 12px;
+    font-variant-numeric: tabular-nums; font-weight: 600;
+  }
+  .live { color: var(--ok); }
+  .live::before { content: "\25CF "; font-size: 9px; animation: blink 1.6s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
 
-  nav { display: flex; gap: 2px; margin: 20px 0 24px; border-bottom: 1px solid var(--line); }
+  /* --- nav: bracketed selector ------------------------------------------ */
+  nav { display: flex; gap: 0; margin: 0 0 14px; border-bottom: 1px solid var(--line); }
   nav button {
-    background: none; border: 0; border-bottom: 2px solid transparent;
-    color: var(--dim); font-family: var(--mono); font-size: 12px; letter-spacing: 0.18em;
-    text-transform: uppercase; padding: 10px 16px; cursor: pointer; transition: color .15s, border-color .15s;
+    background: none; border: 0; border-bottom: 1px solid transparent;
+    color: var(--dim); font-family: var(--mono); font-size: 12px;
+    letter-spacing: 0; text-transform: none; padding: 7px 14px;
+    cursor: pointer; transition: color .12s, background .12s; margin-bottom: -1px;
   }
-  nav button:hover { color: var(--ink); }
-  nav button[aria-selected="true"] { color: var(--accent); border-color: var(--accent); }
+  nav button::before { content: "[ "; opacity: 0; }
+  nav button::after  { content: " ]"; opacity: 0; }
+  nav button:hover { color: var(--ink-2); }
+  nav button[aria-selected="true"] {
+    color: var(--accent); border-color: var(--accent); background: rgba(240,136,62,.05);
+  }
+  nav button[aria-selected="true"]::before,
+  nav button[aria-selected="true"]::after { opacity: .55; }
 
-  .panel {
-    background: linear-gradient(180deg, var(--panel), var(--panel-2));
-    border: 1px solid var(--line); border-radius: 4px;
+  /* --- panels: hard-edged modules with an inset label -------------------- */
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 0; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; }
+  .tile { padding: 9px 12px 11px; position: relative; }
+  .tile .k {
+    color: var(--dim); font-size: 11px; letter-spacing: 0; text-transform: none;
   }
-  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
-  .tile { padding: 16px 18px; position: relative; overflow: hidden; }
-  .tile .k { color: var(--dim); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; }
-  .tile .v { font-size: 30px; margin-top: 8px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
-  .tile .v small { font-size: 13px; color: var(--dim); }
-  .tile .bar { margin-top: 10px; }
+  .tile .v {
+    font-size: 21px; margin-top: 3px; font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em; font-weight: 600; color: var(--ink);
+  }
+  .tile .v small { font-size: 11px; color: var(--dim); font-weight: 400; }
+  .tile .bar { margin-top: 7px; }
+  .tile.accent { border-color: var(--accent-d); }
   .tile.accent .v { color: var(--accent); }
 
-  section.grid { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; margin-top: 14px; }
-  @media (max-width: 780px) { section.grid { grid-template-columns: 1fr; } nav { overflow-x: auto; } }
-  .card { padding: 16px 18px; }
-  .card h2 { font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--dim); margin: 0 0 14px; font-weight: 600; }
+  section.grid { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; margin-top: 8px; }
+  @media (max-width: 820px) { section.grid { grid-template-columns: 1fr; } nav { overflow-x: auto; } }
+  .card { padding: 0 0 10px; }
+  .card h2 {
+    font-size: 11px; letter-spacing: 0; text-transform: none; color: var(--ink-2);
+    margin: 0 0 9px; font-weight: 600; padding: 6px 12px;
+    background: var(--panel-2); border-bottom: 1px solid var(--line);
+  }
+  .card h2::before { content: "\2500\2500 "; color: var(--dim); }
+  .card > *:not(h2) { margin-left: 12px; margin-right: 12px; }
+  .card > table { width: calc(100% - 24px); }
 
+  /* --- dense tables ------------------------------------------------------ */
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  th { color: var(--dim); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; cursor: pointer; user-select: none; font-weight: 600; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th {
+    color: var(--dim); font-size: 11px; letter-spacing: 0; text-transform: none;
+    cursor: pointer; user-select: none; font-weight: 600;
+    border-bottom-color: var(--line-2);
+  }
   th.num, td.num { text-align: right; }
-  tbody tr:hover { background: rgba(53, 224, 196, 0.05); }
+  tbody tr:hover { background: rgba(240,136,62,.045); }
+  tbody tr:hover td.name { color: var(--accent); }
   td.name { color: var(--ink); }
   .muted { color: var(--dim); }
-  .chip { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); }
-  .chip.ok { color: var(--ok); border-color: rgba(74,222,128,.35); }
-  .chip.err { color: var(--err); border-color: rgba(248,114,106,.35); }
+  .chip {
+    display: inline-block; padding: 0 5px; border-radius: 0; font-size: 11px;
+    border: 1px solid var(--line-2); color: var(--ink-2);
+  }
+  .chip.ok  { color: var(--ok);  border-color: rgba(91,191,122,.4); }
+  .chip.err { color: var(--err); border-color: rgba(224,87,79,.4); }
 
-  .meter { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  /* --- meters ------------------------------------------------------------ */
+  .meter { height: 4px; background: var(--line); border-radius: 0; overflow: hidden; }
   .meter > i { display: block; height: 100%; background: var(--accent); }
-  .lane { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; align-items: center; margin-bottom: 12px; }
-  .lane .lbl { font-size: 12px; }
+  .lane { display: grid; grid-template-columns: 1fr auto; gap: 3px 12px; align-items: center; margin-bottom: 9px; }
+  .lane .lbl { font-size: 12px; color: var(--ink); }
   .lane .val { color: var(--dim); font-size: 11px; }
   .lane .meter { grid-column: 1 / -1; }
 
   svg .axis { stroke: var(--line); }
-  svg .spark { fill: none; stroke: var(--accent); stroke-width: 1.6; }
-  svg .fillarea { fill: rgba(53,224,196,0.10); }
+  svg .spark { fill: none; stroke: var(--accent); stroke-width: 1.4; }
+  svg .fillarea { fill: rgba(240,136,62,.09); }
 
-  .empty { color: var(--dim); padding: 24px 4px; font-size: 12px; }
+  .empty { color: var(--dim); padding: 16px 0; font-size: 12px; }
+  .empty::before { content: "\2014 "; }
   .hidden { display: none; }
-  .fade { opacity: 0; transform: translateY(6px); animation: rise .5s forwards; }
-  @keyframes rise { to { opacity: 1; transform: none; } }
-  footer { margin-top: 30px; color: var(--dim); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; }
+  .fade { opacity: 0; animation: rise .28s ease-out forwards; }
+  @keyframes rise { to { opacity: 1; } }
+  .alert {
+    margin-bottom: 8px; border-color: var(--accent-d);
+    background: linear-gradient(90deg, rgba(240,136,62,.07), transparent 45%);
+  }
+  .alert-head { padding: 7px 12px 0; color: var(--accent); font-weight: 600; }
+  .alert-body { padding: 2px 12px 8px; color: var(--ink-2); font-size: 11px; }
+
+  footer {
+    margin-top: 20px; color: var(--dim); font-size: 11px;
+    letter-spacing: 0; text-transform: none;
+    border-top: 1px solid var(--line); padding-top: 9px;
+  }
 </style>
 
 <div class="wrap">
   <header class="fade">
-    <span class="mark">SL<b>/</b>UICE</span>
-    <span class="tag">gateway console</span>
+    <span class="mark"><b>▍</b>sluice</span>
+    <span class="tag">gateway · console</span>
     <div class="strip" id="strip">
       <div>status<b class="live" id="s-live">live</b></div>
       <div>lanes<b id="s-lanes">–</b></div>
@@ -130,11 +186,9 @@
     console says "0% capacity used" at precisely the moment nothing can get
     through, which reads as a broken proxy rather than a throttled model.
   -->
-  <div id="pressure-banner" class="panel hidden" style="margin-bottom:14px;border-left:3px solid var(--warn,#e0a030)">
-    <div style="padding:10px 12px">
-      <b>Upstream is limiting concurrency, not rate.</b>
-      <div class="muted" style="font-size:12px;margin-top:4px" id="pressure-banner-text"></div>
-    </div>
+  <div id="pressure-banner" class="panel hidden alert">
+    <div class="alert-head">[ !! ] upstream is limiting concurrency, not rate</div>
+    <div class="alert-body" id="pressure-banner-text"></div>
   </div>
 
   <nav id="tabs">
