@@ -228,6 +228,53 @@ pub async fn start_key_reporting_mock() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// A mock provider that 429s `sick_key` with a `Retry-After`, counting how many
+/// times that key is presented. Lets a test prove the proxy remembers a rebuff
+/// across requests instead of rediscovering the same wall on every one.
+pub async fn start_benching_mock(
+    sick_key: &str,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let sick = format!("Bearer {sick_key}");
+    let counter = hits.clone();
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(move |headers: axum::http::HeaderMap| {
+            let sick = sick.clone();
+            let counter = counter.clone();
+            async move {
+                let auth = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default();
+                if auth == sick {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    return (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [(axum::http::header::RETRY_AFTER, "5")],
+                        r#"{"error":"rate limited"}"#,
+                    )
+                        .into_response();
+                }
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"mock":"ok"}"#,
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://127.0.0.1:{port}"), hits)
+}
+
 /// A mock provider that waits `delay` before answering — used to trip deadlines.
 pub async fn start_slow_mock(delay: Duration) -> String {
     let app = axum::Router::new().route(

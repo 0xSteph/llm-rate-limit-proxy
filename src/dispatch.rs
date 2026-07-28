@@ -60,6 +60,13 @@ impl Dispatcher {
                     continue;
                 }
                 eligible = true;
+                // A lane the provider told us to back off from stays out of
+                // rotation until its cooldown ends, but still counts as eligible
+                // so an all-benched pool waits instead of reporting itself empty.
+                if let Some(until) = lane.cooldown_ends(now) {
+                    soonest = Some(soonest.map_or(until, |s: Instant| s.min(until)));
+                    continue;
+                }
                 let load = lane.load(now);
                 if load < lane.rpm {
                     with_room.push((load, idx));
@@ -158,6 +165,33 @@ mod tests {
             on_lane[d.acquire().await.lane_idx] += 1;
         }
         assert_eq!(on_lane, [2, 2], "load should spread, not fill lane 0 first");
+    }
+
+    #[tokio::test]
+    async fn a_benched_lane_is_skipped_for_a_healthy_one() {
+        let pool = Pool::with_window(vec![spec("a", 40), spec("b", 40)], Duration::from_secs(60));
+        pool.lanes()[0].bench(Instant::now() + Duration::from_secs(30));
+        let d = Dispatcher::new(handle(pool));
+        for _ in 0..3 {
+            assert_eq!(
+                d.acquire().await.lane_idx,
+                1,
+                "a lane the provider told us to back off from must be routed around"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_lane_benched_waits_out_the_cooldown_rather_than_failing() {
+        let pool = Pool::with_window(vec![spec("a", 40)], Duration::from_secs(60));
+        pool.lanes()[0].bench(Instant::now() + Duration::from_millis(200));
+        let d = Dispatcher::new(handle(pool));
+        let t0 = Instant::now();
+        assert_eq!(d.acquire().await.lane_idx, 0);
+        assert!(
+            t0.elapsed() >= Duration::from_millis(150),
+            "a benched pool should wait, not report itself empty"
+        );
     }
 
     #[tokio::test]

@@ -259,6 +259,61 @@ async fn a_conversation_keeps_one_key_as_its_transcript_grows() {
 }
 
 #[tokio::test]
+async fn a_rate_limited_key_is_benched_so_the_next_request_skips_it() {
+    use sluice::auth::{hash_password, new_client_key};
+    use sluice::config::{Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION};
+    use std::sync::atomic::Ordering;
+
+    let (mock, sick_hits) = support::start_benching_mock("sick-key").await;
+    let (client_secret, client_rec) = new_client_key("test", "admin");
+    let store = StoredConfig {
+        version: STORE_VERSION,
+        users: vec![User {
+            username: "admin".into(),
+            pw_hash: hash_password("password123"),
+            role: Role::Superuser,
+        }],
+        providers: vec![Provider {
+            name: "mock".into(),
+            base_url: mock.clone(),
+            keys: ["sick-key", "healthy-key"]
+                .iter()
+                .map(|k| ProviderKey {
+                    key: (*k).into(),
+                    enabled: true,
+                    rpm: 40,
+                    owner: "admin".into(),
+                })
+                .collect(),
+        }],
+        clients: vec![client_rec],
+        aliases: vec![],
+        settings: Default::default(),
+    };
+    let s = Server::start_seeded(&store, &[]).await;
+
+    // No `messages`, so there is no session affinity: both requests fall to the
+    // least-loaded lane and tie-break onto the sick key unless it gets benched.
+    for _ in 0..2 {
+        let r = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base_url))
+            .header("authorization", format!("Bearer {client_secret}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    assert_eq!(
+        sick_hits.load(Ordering::Relaxed),
+        1,
+        "the rebuff must be remembered pool-wide, not rediscovered every request"
+    );
+}
+
+#[tokio::test]
 async fn deadline_exceeded_returns_504() {
     let mock = support::start_slow_mock(Duration::from_secs(3)).await;
     let s = Server::start().await;

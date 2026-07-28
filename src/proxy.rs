@@ -85,6 +85,34 @@ fn is_retryable(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
+/// Longest we honor a provider's `Retry-After`. Beyond this the value is more
+/// likely wrong than real, and obeying it would park a paid key for no reason.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// How long the provider asked us to stay away, from `Retry-After`. Only the
+/// delta-seconds form is read — RFC 9110 also allows an HTTP-date, which needs a
+/// date parser we don't carry; that form reads as "no guidance" so the caller
+/// falls back to its own backoff instead of guessing at zero.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let raw = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+}
+
+/// Cooldown for a lane the provider rebuffed without saying for how long.
+const DEFAULT_BENCH: Duration = Duration::from_secs(5);
+
+/// Take the rebuffed lane out of rotation for as long as the provider asked, or
+/// a short default. A key that just answered 429 will answer the same way to the
+/// next request, so without this every request pays to rediscover it.
+fn bench_lane(state: &AppState, lane_idx: usize, headers: &HeaderMap) {
+    let cooldown = retry_after(headers).unwrap_or(DEFAULT_BENCH);
+    let pool = state.pool.read().unwrap().clone();
+    if let Some(lane) = pool.lanes().get(lane_idx) {
+        lane.bench(Instant::now() + cooldown);
+    }
+}
+
 // --- Routing plan ------------------------------------------------------------
 
 /// One attempt in a request's routing plan: which provider to target (any if
@@ -316,9 +344,14 @@ pub async fn handle(
         };
         match sent {
             Ok(resp) => {
-                if is_retryable(resp.status().as_u16()) && !is_last {
-                    excluded.push(permit.lane_idx);
-                    continue;
+                if is_retryable(resp.status().as_u16()) {
+                    // Bench even on the last step: this request is out of options,
+                    // but the next one shouldn't walk into the same wall.
+                    bench_lane(&state, permit.lane_idx, resp.headers());
+                    if !is_last {
+                        excluded.push(permit.lane_idx);
+                        continue;
+                    }
                 }
                 let status = resp.status().as_u16();
                 state
@@ -499,9 +532,12 @@ async fn stream_proxy(
         };
         match sent {
             Ok(resp) => {
-                if is_retryable(resp.status().as_u16()) && !is_last {
-                    excluded.push(permit.lane_idx);
-                    continue;
+                if is_retryable(resp.status().as_u16()) {
+                    bench_lane(&state, permit.lane_idx, resp.headers());
+                    if !is_last {
+                        excluded.push(permit.lane_idx);
+                        continue;
+                    }
                 }
                 state.metrics.record_request(&client, &model, "200");
                 state.metrics.record_lane(&permit.provider);
@@ -544,5 +580,49 @@ async fn stream_body(resp: reqwest::Response, deadline: Option<Instant>, tx: &Tx
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_retry_after(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::RETRY_AFTER, HeaderValue::from_str(v).unwrap());
+        h
+    }
+
+    #[test]
+    fn retry_after_reads_delta_seconds() {
+        assert_eq!(
+            retry_after(&with_retry_after("5")),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn retry_after_is_none_without_the_header() {
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn retry_after_ignores_values_it_cannot_read() {
+        // The HTTP-date form is valid per RFC 9110 but unsupported here. It has to
+        // read as "no guidance" so the caller uses its own backoff, never as zero.
+        assert_eq!(
+            retry_after(&with_retry_after("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(retry_after(&with_retry_after("soon")), None);
+    }
+
+    #[test]
+    fn retry_after_clamps_absurd_backoffs() {
+        // A buggy or hostile upstream must not be able to park a key for a day.
+        assert_eq!(
+            retry_after(&with_retry_after("86400")),
+            Some(MAX_RETRY_AFTER)
+        );
     }
 }

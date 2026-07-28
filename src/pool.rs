@@ -76,17 +76,44 @@ pub struct Lane {
     pub key: String,
     pub rpm: usize,
     limiter: Mutex<SlidingWindow>,
+    cooldown_until: Mutex<Option<Instant>>,
 }
 
 impl Lane {
     fn new(spec: LaneSpec, window: Duration) -> Self {
         Self {
             limiter: Mutex::new(SlidingWindow::new(spec.rpm, window)),
+            cooldown_until: Mutex::new(None),
             provider: spec.provider,
             base_url: spec.base_url,
             key: spec.key,
             rpm: spec.rpm,
         }
+    }
+
+    /// Take this lane out of rotation until `until`. A key that just answered 429
+    /// or 5xx will answer the same way to the next request, so the rebuff has to
+    /// be remembered by the pool rather than only by the request that found it.
+    pub fn bench(&self, until: Instant) {
+        let mut cooldown = self.cooldown_until.lock().unwrap();
+        // Never shorten a bench already in force: concurrent failures on the same
+        // lane must not let a smaller backoff cancel a larger one.
+        *cooldown = Some(cooldown.map_or(until, |current| current.max(until)));
+    }
+
+    pub fn benched(&self, now: Instant) -> bool {
+        self.cooldown_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| until > now)
+    }
+
+    /// When this lane's cooldown ends, if it is benched right now.
+    pub fn cooldown_ends(&self, now: Instant) -> Option<Instant> {
+        self.cooldown_until
+            .lock()
+            .unwrap()
+            .filter(|&until| until > now)
     }
 
     pub fn try_acquire(&self, now: Instant) -> Result<(), Instant> {
@@ -327,6 +354,28 @@ mod tests {
             moved < 300,
             "relocated {moved}/1200 sessions; expected ~1/6 (200)"
         );
+    }
+
+    #[test]
+    fn a_benched_lane_is_out_of_rotation_until_its_cooldown_expires() {
+        let pool = Pool::new(specs(1));
+        let lane = &pool.lanes()[0];
+        let now = Instant::now();
+        lane.bench(now + Duration::from_secs(5));
+        assert!(lane.benched(now));
+        assert!(!lane.benched(now + Duration::from_secs(6)));
+    }
+
+    /// Two requests can discover the same sick key at once. The shorter of their
+    /// two backoffs must not cancel the longer one already in force.
+    #[test]
+    fn benching_a_lane_again_never_shortens_its_cooldown() {
+        let pool = Pool::new(specs(1));
+        let lane = &pool.lanes()[0];
+        let now = Instant::now();
+        lane.bench(now + Duration::from_secs(30));
+        lane.bench(now + Duration::from_secs(2));
+        assert!(lane.benched(now + Duration::from_secs(10)));
     }
 
     /// Affinity is keyed on lane identity, not lane index, so a pool rebuild that
