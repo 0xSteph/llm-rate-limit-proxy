@@ -79,7 +79,7 @@ pub async fn setup_submit(
         });
         store.providers.push(config::Provider {
             name: form.provider_name.clone(),
-            base_url: form.base_url.trim_end_matches('/').to_string(),
+            base_url: config::normalize_base_url(&form.base_url),
             keys: vec![config::ProviderKey {
                 key: form.api_key.clone(),
                 enabled: true,

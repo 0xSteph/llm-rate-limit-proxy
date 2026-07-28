@@ -148,6 +148,19 @@ impl StoredConfig {
     }
 }
 
+/// Normalize a provider base URL for path-forwarding.
+///
+/// A request arrives with its full path (`/v1/chat/completions`) and that path is
+/// forwarded verbatim, so the base must not itself end in `/v1` — the result is
+/// `/v1/v1/chat/completions`, which no provider routes. Every OpenAI-compatible
+/// client trains its users to write the base *with* `/v1`, so this is the
+/// mistake people actually make, and what comes back is a bare router 404
+/// ("404 page not found") that names nothing and points at nothing.
+pub fn normalize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
+}
+
 pub fn store_path(dir: &Path) -> PathBuf {
     dir.join("config.json")
 }
@@ -261,5 +274,50 @@ mod tests {
     #[test]
     fn superuser_found() {
         assert_eq!(sample().superuser().unwrap().username, "admin");
+    }
+}
+
+#[cfg(test)]
+mod base_url_tests {
+    use super::*;
+
+    /// Requests are forwarded with their full path (`/v1/chat/completions`), so a
+    /// base that already ends in `/v1` produces `/v1/v1/chat/completions`. Every
+    /// OpenAI-compatible client trains its users to write the base *with* `/v1`,
+    /// and the provider answers a bare router 404 that names nothing useful.
+    #[test]
+    fn a_v1_suffix_is_stripped_because_the_client_path_supplies_it() {
+        assert_eq!(
+            normalize_base_url("https://integrate.api.nvidia.com/v1"),
+            "https://integrate.api.nvidia.com"
+        );
+        assert_eq!(
+            normalize_base_url("https://integrate.api.nvidia.com/v1/"),
+            "https://integrate.api.nvidia.com"
+        );
+    }
+
+    #[test]
+    fn trailing_slashes_and_whitespace_are_trimmed() {
+        assert_eq!(normalize_base_url("  https://host/  "), "https://host");
+    }
+
+    /// A provider mounted under a prefix still works: the prefix is kept and only
+    /// the version segment the client path supplies is removed.
+    #[test]
+    fn a_path_prefix_before_v1_is_preserved() {
+        assert_eq!(
+            normalize_base_url("https://host/api/v1"),
+            "https://host/api"
+        );
+    }
+
+    #[test]
+    fn a_base_without_v1_is_left_alone() {
+        assert_eq!(normalize_base_url("https://host"), "https://host");
+        assert_eq!(
+            normalize_base_url("https://host/v1beta"),
+            "https://host/v1beta"
+        );
     }
 }
