@@ -120,8 +120,22 @@
       <div>capacity<b id="s-cap">–</b><span class="tag">rpm</span></div>
       <div>uptime<b id="s-up">–</b></div>
       <div>build<b id="s-ver">–</b></div>
+      <div id="s-pressure-wrap" class="hidden">held back<b id="s-pressure" style="color:var(--warn,#e0a030)">–</b></div>
     </div>
   </header>
+
+  <!--
+    Requests held by model pressure never reach the rate limiter, so every rate
+    figure on this page reads idle while they wait. Without this banner the
+    console says "0% capacity used" at precisely the moment nothing can get
+    through, which reads as a broken proxy rather than a throttled model.
+  -->
+  <div id="pressure-banner" class="panel hidden" style="margin-bottom:14px;border-left:3px solid var(--warn,#e0a030)">
+    <div style="padding:10px 12px">
+      <b>Upstream is limiting concurrency, not rate.</b>
+      <div class="muted" style="font-size:12px;margin-top:4px" id="pressure-banner-text"></div>
+    </div>
+  </div>
 
   <nav id="tabs">
     <button data-tab="overview" aria-selected="true">Overview</button>
@@ -192,6 +206,15 @@
       <div id="lanes"></div>
       <div class="muted" style="font-size:11px" id="lanes-note"></div>
     </div>
+    <div class="panel card" style="margin-top:14px">
+      <h2>Model pressure</h2>
+      <div id="pressure"></div>
+      <div class="muted" style="font-size:11px;margin-top:6px">
+        A provider caps how many requests may run at once on a model. That cap is
+        shared across every key, so adding keys does not raise it and failing over
+        cannot relieve it. Requests waiting here never consume rate budget.
+      </div>
+    </div>
   </div>
 
   <!-- RELIABILITY -->
@@ -220,7 +243,7 @@
   const pct = (n) => (n * 100).toFixed(n >= 0.9995 ? 0 : 1) + "%";
   const classOf = (s) => { const c = +s; return c && c < 400 ? "ok" : "err"; };
 
-  let cfg = {}, stats = {}, hist = [];
+  let cfg = {}, stats = {}, hist = [], pressure = [];
   const sortState = {}; // per-table
 
   async function getJSON(url) {
@@ -367,6 +390,26 @@
       <div class="meter"><i style="width:${(l.requests / max * 100).toFixed(1)}%"></i></div></div>`).join("")
       : `<div class="empty">No lane traffic yet</div>`;
     $("lanes-note").textContent = cfg.rpms ? "per-key ceilings: " + cfg.rpms.join(" / ") + " rpm" : "";
+    renderPressure();
+  }
+
+  function renderPressure() {
+    const held = pressure.length;
+    $("s-pressure-wrap").classList.toggle("hidden", !held);
+    $("pressure-banner").classList.toggle("hidden", !held);
+    if (held) {
+      $("s-pressure").textContent = held + (held === 1 ? " model" : " models");
+      $("pressure-banner-text").textContent =
+        pressure.map((p) => `${p.model} is capped at ${p.limit} concurrent (${p.inflight} running)`).join(" · ")
+        + " — rate capacity below will read low while these wait.";
+    }
+    $("pressure").innerHTML = held
+      ? pressure.map((p) => `<div class="lane">
+          <span class="lbl">${esc(p.model)}</span>
+          <span class="val">${nfmt(p.inflight)} / ${nfmt(p.limit)} concurrent</span>
+          <div class="meter"><i style="width:${Math.min(100, p.inflight / Math.max(1, p.limit) * 100).toFixed(1)}%"></i></div>
+        </div>`).join("")
+      : `<div class="empty">No model is being held back</div>`;
   }
 
   function renderAll() {
@@ -387,11 +430,12 @@
 
   async function refresh() {
     try {
-      const [c, s, h] = await Promise.all([
+      const [c, s, h, p] = await Promise.all([
         getJSON("/dash/config.json"), getJSON("/api/stats"), getJSON("/api/history"),
+        getJSON("/api/pressure"),
       ]);
       if (!c) return; // redirected to login
-      cfg = c; stats = s; hist = h || [];
+      cfg = c; stats = s; hist = h || []; pressure = (p && p.pressured) || [];
       $("s-live").textContent = "live";
       renderAll();
     } catch (err) {

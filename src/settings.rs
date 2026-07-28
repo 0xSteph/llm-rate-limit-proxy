@@ -173,14 +173,7 @@ pub async fn provider_keys(
         }
     }
 
-    match apply(&state) {
-        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": {"message": e, "code": "save_failed"}})),
-        )
-            .into_response(),
-    }
+    finish(&state)
 }
 
 fn check_rpm(rpm: usize) -> Result<(), String> {
@@ -188,6 +181,169 @@ fn check_rpm(rpm: usize) -> Result<(), String> {
         0 => Err("rpm must be at least 1; disable the key instead".into()),
         r if r > 10_000 => Err("rpm above 10000 is not a real provider limit".into()),
         _ => Ok(()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ProviderAction {
+    Add {
+        name: String,
+        base_url: String,
+        key: String,
+        rpm: Option<usize>,
+    },
+    Remove {
+        name: String,
+    },
+    SetBaseUrl {
+        name: String,
+        base_url: String,
+    },
+}
+
+/// Add, remove, or re-point an upstream provider.
+///
+/// Base URLs go through the same normalization the proxy relies on, so a URL
+/// pasted with a trailing `/v1` — which every OpenAI-compatible client teaches
+/// people to write — can't silently produce `/v1/v1/...` and a bare 404.
+pub async fn providers(
+    State(state): State<Arc<AppState>>,
+    Json(action): Json<ProviderAction>,
+) -> Response {
+    {
+        let mut store = state.store.lock().unwrap();
+        match action {
+            ProviderAction::Add {
+                name,
+                base_url,
+                key,
+                rpm,
+            } => {
+                let name = name.trim().to_string();
+                let key = key.trim().to_string();
+                if name.is_empty() {
+                    return bad_request("provider name must not be empty");
+                }
+                if key.is_empty() {
+                    return bad_request("a provider needs at least one key to be useful");
+                }
+                if store.providers.iter().any(|p| p.name == name) {
+                    return bad_request("a provider with that name already exists");
+                }
+                let rpm = rpm.unwrap_or(40);
+                if let Err(e) = check_rpm(rpm) {
+                    return bad_request(&e);
+                }
+                let base_url = config::normalize_base_url(&base_url);
+                if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+                    return bad_request("base_url must start with http:// or https://");
+                }
+                store.providers.push(config::Provider {
+                    name,
+                    base_url,
+                    keys: vec![config::ProviderKey {
+                        key,
+                        enabled: true,
+                        rpm,
+                        owner: String::new(),
+                    }],
+                });
+            }
+            ProviderAction::Remove { name } => {
+                let before = store.providers.len();
+                store.providers.retain(|p| p.name != name);
+                if store.providers.len() == before {
+                    return bad_request("no provider by that name");
+                }
+                // Aliases pointing at a provider that no longer exists would fail
+                // at request time with nothing explaining why, so prune them here.
+                for alias in &mut store.aliases {
+                    alias.targets.retain(|t| t.provider != name);
+                }
+                store.aliases.retain(|a| !a.targets.is_empty());
+            }
+            ProviderAction::SetBaseUrl { name, base_url } => {
+                let base_url = config::normalize_base_url(&base_url);
+                if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+                    return bad_request("base_url must start with http:// or https://");
+                }
+                let Some(p) = store.providers.iter_mut().find(|p| p.name == name) else {
+                    return bad_request("no provider by that name");
+                };
+                p.base_url = base_url;
+            }
+        }
+        if pool::lane_specs(&store).is_empty() {
+            return bad_request("that would leave no enabled keys and stop the proxy serving");
+        }
+    }
+    finish(&state)
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AliasAction {
+    Upsert {
+        name: String,
+        targets: Vec<config::AliasTarget>,
+    },
+    Remove {
+        name: String,
+    },
+}
+
+/// Define or drop a virtual model — a name that resolves to an ordered list of
+/// concrete targets, tried in turn, so a request survives one provider being
+/// down or one model being unavailable.
+pub async fn aliases(
+    State(state): State<Arc<AppState>>,
+    Json(action): Json<AliasAction>,
+) -> Response {
+    {
+        let mut store = state.store.lock().unwrap();
+        match action {
+            AliasAction::Upsert { name, targets } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return bad_request("alias name must not be empty");
+                }
+                if targets.is_empty() {
+                    return bad_request("an alias needs at least one target to route to");
+                }
+                // A target naming a provider that doesn't exist can never be
+                // reached, and the failure would surface as an opaque routing miss
+                // long after the mistake was made.
+                if let Some(missing) = targets
+                    .iter()
+                    .find(|t| !store.providers.iter().any(|p| p.name == t.provider))
+                {
+                    return bad_request(&format!("no provider named {}", missing.provider));
+                }
+                store.aliases.retain(|a| a.name != name);
+                store.aliases.push(config::Alias { name, targets });
+            }
+            AliasAction::Remove { name } => {
+                let before = store.aliases.len();
+                store.aliases.retain(|a| a.name != name);
+                if store.aliases.len() == before {
+                    return bad_request("no alias by that name");
+                }
+            }
+        }
+    }
+    finish(&state)
+}
+
+/// Persist and rebuild, mapping the outcome to a response.
+fn finish(state: &Arc<AppState>) -> Response {
+    match apply(state) {
+        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": {"message": e, "code": "save_failed"}})),
+        )
+            .into_response(),
     }
 }
 

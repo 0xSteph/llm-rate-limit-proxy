@@ -692,6 +692,164 @@ async fn the_settings_view_never_returns_a_secret() {
     );
 }
 
+/// Guards the gap that made this confusing in the first place: the endpoint
+/// existing is not the same as an operator being able to see it. Someone staring
+/// at 0% capacity while nothing gets through needs the console to say why.
+#[tokio::test]
+async fn the_console_reads_and_surfaces_model_pressure() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+    s.login("admin", "password123").await;
+
+    let html = s.get("/").await.text().await.unwrap();
+    assert!(
+        html.contains("/api/pressure"),
+        "the console must actually fetch the pressure endpoint"
+    );
+    assert!(
+        html.contains("pressure-banner"),
+        "and surface it, not just hold it in a variable"
+    );
+}
+
+/// The multi-provider case end to end: a model that lives on one provider, a
+/// fallback on another, both behind one endpoint and one client key — all
+/// configured while the proxy is running.
+#[tokio::test]
+async fn a_second_provider_and_a_fallback_alias_can_be_added_live() {
+    let primary = support::start_mock_upstream().await;
+    let secondary = support::start_echo_mock().await;
+    let s = Server::start().await;
+    let client_key = s
+        .complete_wizard_get_key("admin", "password123", "main", &primary, "k1")
+        .await;
+    s.login("admin", "password123").await;
+
+    // Deliberately pasted with the /v1 suffix every OpenAI-compatible client asks
+    // for; it has to be normalized away or requests 404 later with no clue why.
+    let r = settings_post(
+        &s,
+        "/api/settings/providers",
+        serde_json::json!({
+            "action": "add", "name": "backup",
+            "base_url": format!("{secondary}/v1"), "key": "k2"
+        }),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+
+    let r = settings_post(
+        &s,
+        "/api/settings/aliases",
+        serde_json::json!({
+            "action": "upsert", "name": "my-agent",
+            "targets": [
+                {"provider": "backup", "model": "model-b"},
+                {"provider": "main", "model": "model-a"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+
+    let view: serde_json::Value = s.get("/api/settings").await.json().await.unwrap();
+    let backup = view["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "backup")
+        .expect("the new provider is stored");
+    assert!(
+        !backup["base_url"].as_str().unwrap().ends_with("/v1"),
+        "a pasted /v1 suffix must be normalized away: {backup}"
+    );
+
+    let catalog: serde_json::Value = s
+        .client
+        .get(format!("{}/v1/models", s.base_url))
+        .header("authorization", format!("Bearer {client_key}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = catalog["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&"my-agent"),
+        "a harness can only route to a virtual model it can see: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_alias_pointing_at_an_unknown_provider_is_refused() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "main", &mock, "k1")
+        .await;
+    s.login("admin", "password123").await;
+
+    let r = settings_post(
+        &s,
+        "/api/settings/aliases",
+        serde_json::json!({
+            "action": "upsert", "name": "broken",
+            "targets": [{"provider": "does-not-exist", "model": "m"}]
+        }),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        400,
+        "an unreachable target would surface much later as an opaque routing miss"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_provider_prunes_aliases_that_pointed_at_it() {
+    let primary = support::start_mock_upstream().await;
+    let secondary = support::start_echo_mock().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "main", &primary, "k1")
+        .await;
+    s.login("admin", "password123").await;
+
+    settings_post(
+        &s,
+        "/api/settings/providers",
+        serde_json::json!({"action": "add", "name": "temp", "base_url": secondary, "key": "k2"}),
+    )
+    .await;
+    settings_post(
+        &s,
+        "/api/settings/aliases",
+        serde_json::json!({
+            "action": "upsert", "name": "doomed",
+            "targets": [{"provider": "temp", "model": "m"}]
+        }),
+    )
+    .await;
+    settings_post(
+        &s,
+        "/api/settings/providers",
+        serde_json::json!({"action": "remove", "name": "temp"}),
+    )
+    .await;
+
+    let view: serde_json::Value = s.get("/api/settings").await.json().await.unwrap();
+    assert!(
+        view["aliases"].as_array().unwrap().is_empty(),
+        "an alias with no reachable target is a routing failure waiting to happen: {view}"
+    );
+}
+
 #[tokio::test]
 async fn settings_are_closed_to_anonymous_callers() {
     let mock = support::start_mock_upstream().await;
