@@ -382,6 +382,62 @@ async fn requests_past_the_concurrency_cap_are_shed_with_retry_after() {
 }
 
 #[tokio::test]
+async fn pressure_on_a_model_is_detected_across_keys_and_reported() {
+    use sluice::auth::{hash_password, new_client_key};
+    use sluice::config::{Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION};
+
+    // Every key is rebuffed, so failing over cannot help — the signature of a
+    // model-scoped limit rather than a per-key one.
+    let mock = support::start_pressured_mock().await;
+    let (client_secret, client_rec) = new_client_key("test", "admin");
+    let store = StoredConfig {
+        version: STORE_VERSION,
+        users: vec![User {
+            username: "admin".into(),
+            pw_hash: hash_password("password123"),
+            role: Role::Superuser,
+        }],
+        providers: vec![Provider {
+            name: "mock".into(),
+            base_url: mock.clone(),
+            keys: (0..4)
+                .map(|i| ProviderKey {
+                    key: format!("key-{i}"),
+                    enabled: true,
+                    rpm: 40,
+                    owner: "admin".into(),
+                })
+                .collect(),
+        }],
+        clients: vec![client_rec],
+        aliases: vec![],
+        settings: Default::default(),
+    };
+    let s = Server::start_seeded(&store, &[]).await;
+
+    s.client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {client_secret}"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"squeezed","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    s.login("admin", "password123").await;
+    let body: serde_json::Value = s.get("/api/pressure").await.json().await.unwrap();
+    let pressured = body["pressured"].as_array().unwrap();
+
+    assert_eq!(
+        pressured.len(),
+        1,
+        "rebuffs across distinct keys should indict the model: {body}"
+    );
+    assert_eq!(pressured[0]["model"], "squeezed");
+    assert!(pressured[0]["limit"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
 async fn deadline_exceeded_returns_504() {
     let mock = support::start_slow_mock(Duration::from_secs(3)).await;
     let s = Server::start().await;

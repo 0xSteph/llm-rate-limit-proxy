@@ -275,6 +275,27 @@ pub async fn start_benching_mock(
     (format!("http://127.0.0.1:{port}"), hits)
 }
 
+/// A mock provider that rebuffs *every* key. Failing over cannot help against
+/// this, which is the signature of a model-scoped limit rather than a per-key one.
+pub async fn start_pressured_mock() -> String {
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(|| async {
+            (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                r#"{"error":"too many concurrent requests for this model"}"#,
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
 /// A mock provider that waits `delay` before answering — used to trip deadlines.
 pub async fn start_slow_mock(delay: Duration) -> String {
     let app = axum::Router::new().route(

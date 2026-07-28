@@ -16,7 +16,7 @@ use axum::Json;
 
 use crate::config::Alias;
 use crate::dispatch::Permit;
-use crate::{auth, AppState};
+use crate::{auth, governor, AppState};
 
 const HEARTBEAT: Duration = Duration::from_secs(15);
 
@@ -135,6 +135,35 @@ pub fn try_admit(counter: &Arc<AtomicUsize>, max: usize) -> Option<InflightGuard
         return None;
     }
     Some(InflightGuard(counter.clone()))
+}
+
+/// How often a request blocked by model pressure re-checks for a free permit.
+/// Slots free stochastically as generations finish, so polling fits better than
+/// a queue: there is no moment to wake a specific waiter.
+const GOVERNOR_POLL: Duration = Duration::from_millis(250);
+
+/// Wait for a model-concurrency permit, giving up if the deadline would pass
+/// first. Ungoverned models return immediately. `beat` is invoked once per poll
+/// so a committed stream can keep its client alive; returning false means the
+/// client is gone.
+async fn admit_model(
+    state: &Arc<AppState>,
+    model: &str,
+    deadline: Option<Instant>,
+    mut beat: impl FnMut() -> bool,
+) -> Option<governor::ModelPermit> {
+    loop {
+        if let Some(permit) = governor::admit(&state.governor, model, Instant::now()) {
+            return Some(permit);
+        }
+        if deadline.is_some_and(|d| Instant::now() + GOVERNOR_POLL >= d) {
+            return None;
+        }
+        tokio::time::sleep(GOVERNOR_POLL).await;
+        if !beat() {
+            return None;
+        }
+    }
 }
 
 /// Cooldown for a lane the provider rebuffed without saying for how long.
@@ -356,6 +385,13 @@ pub async fn handle(
     let mut excluded: Vec<usize> = Vec::new();
     for (i, step) in plan.iter().enumerate() {
         let is_last = i == last;
+        // Model pressure is gated before the rate slot: a request that cannot run
+        // yet shouldn't be holding a key's budget while it waits.
+        let step_model = step.model.as_deref().unwrap_or(&model_label);
+        let Some(_model_permit) = admit_model(&state, step_model, deadline, || true).await else {
+            state.metrics.record_request(&client, &model_label, "504");
+            return deadline_exceeded();
+        };
         let permit = match with_deadline(
             deadline,
             state
@@ -395,6 +431,9 @@ pub async fn handle(
                     // Bench even on the last step: this request is out of options,
                     // but the next one shouldn't walk into the same wall.
                     bench_lane(&state, permit.lane_idx, resp.headers());
+                    state
+                        .governor
+                        .note_rebuff(step_model, permit.lane_idx, Instant::now());
                     if !is_last {
                         excluded.push(permit.lane_idx);
                         continue;
@@ -544,6 +583,15 @@ async fn stream_proxy(
     let mut excluded: Vec<usize> = Vec::new();
     for (i, step) in plan.iter().enumerate() {
         let is_last = i == last;
+        // Heartbeat while waiting on model pressure: the 200 is already committed,
+        // so a silent wait here would look like a hung stream to the client.
+        let step_model = step.model.as_deref().unwrap_or(&model);
+        let beat = || tx.try_send(heartbeat_frame()).is_ok() || !tx.is_closed();
+        let Some(_model_permit) = admit_model(&state, step_model, deadline, beat).await else {
+            state.metrics.record_request(&client, &model, "504");
+            let _ = tx.send(sse_error("deadline_exceeded")).await;
+            return;
+        };
         let permit = match acquire_for_heartbeating(
             &state,
             step.provider.as_deref(),
@@ -584,6 +632,9 @@ async fn stream_proxy(
             Ok(resp) => {
                 if is_retryable(resp.status().as_u16()) {
                     bench_lane(&state, permit.lane_idx, resp.headers());
+                    state
+                        .governor
+                        .note_rebuff(step_model, permit.lane_idx, Instant::now());
                     if !is_last {
                         excluded.push(permit.lane_idx);
                         continue;

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod dispatch;
+pub mod governor;
 pub mod history;
 pub mod metrics;
 pub mod pool;
@@ -40,6 +41,9 @@ pub struct AppState {
     pub provider_window: Duration,
     /// Requests currently in flight, bounded by `settings.max_inflight`.
     pub inflight: Arc<AtomicUsize>,
+    /// Per-model concurrency gate for provider-side pressure that key failover
+    /// cannot relieve.
+    pub governor: Arc<governor::Governor>,
     /// Content-blind request metrics (counts by client/model/status).
     pub metrics: metrics::Metrics,
     /// Persisted 5-minute snapshots for range views.
@@ -68,6 +72,16 @@ async fn api_history(
 
 async fn api_stats(State(state): State<Arc<AppState>>) -> Json<metrics::Stats> {
     Json(state.metrics.stats())
+}
+
+/// Models currently held back by provider-side pressure. Separate from rate
+/// capacity on purpose: these requests never reach the rate limiter, so rate
+/// figures read idle while they wait. An operator seeing "0% capacity used" and
+/// a stalled agent needs this to be visible somewhere.
+async fn api_pressure(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "pressured": state.governor.pressured(std::time::Instant::now()),
+    }))
 }
 
 /// Live bootstrap config for the dashboard (pool shape, capacity, uptime).
@@ -221,6 +235,7 @@ pub async fn run() {
         started: unix_now(),
         dispatch: dispatch::Dispatcher::new(pool.clone()),
         inflight: Arc::new(AtomicUsize::new(0)),
+        governor: Arc::new(governor::Governor::default()),
         pool,
         http,
         provider_window,
@@ -253,6 +268,7 @@ pub async fn run() {
         .route("/metrics", get(metrics_handler))
         .route("/api/history", get(api_history))
         .route("/api/stats", get(api_stats))
+        .route("/api/pressure", get(api_pressure))
         .route("/dash/config.json", get(dash_config))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
