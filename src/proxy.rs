@@ -186,6 +186,20 @@ async fn admit_model(
     }
 }
 
+/// Record a finished request: one metric, one log line.
+///
+/// The **path** is in the line deliberately. A misconfigured harness sends a
+/// path the proxy forwards verbatim, and the provider answers a bare 404 that
+/// names nothing. Seeing `/v1/v1/chat/completions` in the log is the difference
+/// between diagnosing that in seconds and guessing at it for an afternoon.
+fn record(state: &AppState, client: &str, model: &str, path: &str, status: &str, started: Instant) {
+    state.metrics.record_request(client, model, status);
+    println!(
+        "{status} {client} {model} {path} ({} ms)",
+        started.elapsed().as_millis()
+    );
+}
+
 /// Cooldown for a lane the provider rebuffed without saying for how long.
 const DEFAULT_BENCH: Duration = Duration::from_secs(5);
 
@@ -379,7 +393,11 @@ async fn fetch_catalog(
     if !resp.status().is_success() {
         return None;
     }
-    Some(models::extract(&resp.json().await.ok()?))
+    // Deserialize via serde_json rather than reqwest's `json()`: that helper sits
+    // behind a feature only the dev-dependency enables, so using it here builds
+    // under `cargo test` (features unify across dev-deps) and fails a real build.
+    let body = resp.bytes().await.ok()?;
+    Some(models::extract(&serde_json::from_slice(&body).ok()?))
 }
 
 // --- Entry point -------------------------------------------------------------
@@ -391,6 +409,9 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Wall clock for the access line: what the client actually waited, including
+    // queueing and retries, not just the last upstream hop.
+    let t0 = Instant::now();
     if state.setup_required.load(Ordering::Relaxed) {
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -508,7 +529,7 @@ pub async fn handle(
         // yet shouldn't be holding a key's budget while it waits.
         let step_model = step.model.as_deref().unwrap_or(&model_label);
         let Some(_model_permit) = admit_model(&state, step_model, deadline, || true).await else {
-            state.metrics.record_request(&client, &model_label, "504");
+            record(&state, &client, &model_label, &path_query, "504", t0);
             return deadline_exceeded();
         };
         let permit = match with_deadline(
@@ -520,14 +541,14 @@ pub async fn handle(
         .await
         {
             None => {
-                state.metrics.record_request(&client, &model_label, "504");
+                record(&state, &client, &model_label, &path_query, "504", t0);
                 return deadline_exceeded();
             }
             Some(None) => continue, // no eligible lane for this target
             Some(Some(p)) => p,
         };
         let out_body = rewrite_model(&body, step.model.as_deref());
-        let t0 = Instant::now();
+        let upstream_at = Instant::now();
         let send = build_request(
             &state,
             &permit,
@@ -540,7 +561,7 @@ pub async fn handle(
         let sent = match with_deadline(deadline, send).await {
             Some(r) => r,
             None => {
-                state.metrics.record_request(&client, &model_label, "504");
+                record(&state, &client, &model_label, &path_query, "504", t0);
                 return deadline_exceeded();
             }
         };
@@ -559,12 +580,17 @@ pub async fn handle(
                     }
                 }
                 let status = resp.status().as_u16();
+                record(
+                    &state,
+                    &client,
+                    &model_label,
+                    &path_query,
+                    &status.to_string(),
+                    t0,
+                );
                 state
                     .metrics
-                    .record_request(&client, &model_label, &status.to_string());
-                state
-                    .metrics
-                    .record_latency(&model_label, t0.elapsed().as_millis() as u64);
+                    .record_latency(&model_label, upstream_at.elapsed().as_millis() as u64);
                 state.metrics.record_lane(&permit.provider);
                 return relay(&state, &model_label, resp).await;
             }
@@ -573,7 +599,7 @@ pub async fn handle(
                     excluded.push(permit.lane_idx);
                     continue;
                 }
-                state.metrics.record_request(&client, &model_label, "502");
+                record(&state, &client, &model_label, &path_query, "502", t0);
                 return err(
                     StatusCode::BAD_GATEWAY,
                     "upstream_error",
@@ -582,7 +608,7 @@ pub async fn handle(
             }
         }
     }
-    state.metrics.record_request(&client, &model_label, "503");
+    record(&state, &client, &model_label, &path_query, "503", t0);
     err(
         StatusCode::SERVICE_UNAVAILABLE,
         "no_capacity",
@@ -695,6 +721,7 @@ async fn stream_proxy(
     _inflight: InflightGuard,
     tx: Tx,
 ) {
+    let t0 = Instant::now();
     // Immediate heartbeat so the client sees the stream is live right away.
     if tx.send(heartbeat_frame()).await.is_err() {
         return;
@@ -711,7 +738,7 @@ async fn stream_proxy(
         let step_model = step.model.as_deref().unwrap_or(&model);
         let beat = || tx.try_send(heartbeat_frame()).is_ok() || !tx.is_closed();
         let Some(_model_permit) = admit_model(&state, step_model, deadline, beat).await else {
-            state.metrics.record_request(&client, &model, "504");
+            record(&state, &client, &model, &path_query, "504", t0);
             let _ = tx.send(sse_error("deadline_exceeded")).await;
             return;
         };
@@ -728,7 +755,7 @@ async fn stream_proxy(
             Ok(Some(p)) => p,
             Ok(None) => continue,
             Err(()) => {
-                state.metrics.record_request(&client, &model, "504");
+                record(&state, &client, &model, &path_query, "504", t0);
                 let _ = tx.send(sse_error("deadline_exceeded")).await;
                 return;
             }
@@ -747,7 +774,7 @@ async fn stream_proxy(
             let sent = match with_deadline(deadline, send).await {
                 Some(r) => r,
                 None => {
-                    state.metrics.record_request(&client, &model, "504");
+                    record(&state, &client, &model, &path_query, "504", t0);
                     let _ = tx.send(sse_error("deadline_exceeded")).await;
                     return;
                 }
@@ -782,7 +809,7 @@ async fn stream_proxy(
                 if retried_plain && resp.status().is_success() {
                     state.no_inject.lock().unwrap().insert(model.clone());
                 }
-                state.metrics.record_request(&client, &model, "200");
+                record(&state, &client, &model, &path_query, "200", t0);
                 state.metrics.record_lane(&permit.provider);
                 stream_body(resp, deadline, &tx).await;
                 return;
@@ -792,13 +819,13 @@ async fn stream_proxy(
                     excluded.push(permit.lane_idx);
                     continue;
                 }
-                state.metrics.record_request(&client, &model, "502");
+                record(&state, &client, &model, &path_query, "502", t0);
                 let _ = tx.send(sse_error("upstream_error")).await;
                 return;
             }
         }
     }
-    state.metrics.record_request(&client, &model, "503");
+    record(&state, &client, &model, &path_query, "503", t0);
     let _ = tx.send(sse_error("no_capacity")).await;
 }
 
