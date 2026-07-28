@@ -30,6 +30,19 @@ const KEYS_TO_INDICT: usize = 2;
 /// with other tenants' load and a cap we picked minutes ago is stale.
 const DISSOLVE_AFTER: Duration = Duration::from_secs(10 * 60);
 
+/// Minimum gap between two cuts. One episode of pressure produces a burst of
+/// rebuffs — every request already in flight fails at once — and halving on each
+/// of them ratchets the cap toward 1 in seconds. Each cut lowers concurrency,
+/// which lowers the observed in-flight count, which makes the next cut smaller
+/// still: a spiral that ends with the model throttled far below what the
+/// provider would actually allow. One episode, one cut.
+const ADJUST_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Additive increase: a model with no rebuff for this long gets one more permit.
+/// Cutting hard and climbing back slowly is what stops a transient blip from
+/// parking a model at a cap it no longer needs.
+const GROW_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Default)]
 struct ModelState {
     /// Concurrency cap; 0 means ungoverned.
@@ -39,6 +52,8 @@ struct ModelState {
     /// Recent rebuffs as (when, which lane), pruned to `EVIDENCE_WINDOW`.
     rebuffs: Vec<(Instant, usize)>,
     last_rebuff: Option<Instant>,
+    /// When the cap last moved, in either direction. Paces both cuts and growth.
+    last_adjusted: Option<Instant>,
 }
 
 impl ModelState {
@@ -83,7 +98,13 @@ impl Governor {
         state.rebuffs.push((now, lane));
         state.last_rebuff = Some(now);
 
-        if state.implicated_keys() >= KEYS_TO_INDICT {
+        // One episode of pressure fails every in-flight request at once. Cutting
+        // on each of those rebuffs would ratchet the cap toward 1 within seconds.
+        let just_adjusted = state
+            .last_adjusted
+            .is_some_and(|at| now.duration_since(at) < ADJUST_COOLDOWN);
+
+        if state.implicated_keys() >= KEYS_TO_INDICT && !just_adjusted {
             let observed = state.inflight.max(1);
             let backed_off = (observed / 2).max(1);
             let was = state.limit;
@@ -93,6 +114,7 @@ impl Governor {
                 state.limit.min(backed_off)
             };
             if state.limit != was {
+                state.last_adjusted = Some(now);
                 // The one moment worth announcing: from here requests wait on a
                 // gate that consumes no rate budget, so every rate figure will
                 // read low while the proxy is in fact working as hard as allowed.
@@ -120,6 +142,18 @@ impl Governor {
             state.limit = 0;
             state.rebuffs.clear();
             state.last_rebuff = None;
+            state.last_adjusted = None;
+            return 0;
+        }
+        // Additive increase. Without a way back up, one bad moment parks the
+        // model at a reduced cap until it dissolves entirely — throttling it for
+        // minutes on evidence that is seconds old.
+        if state.limit > 0 {
+            let since = state.last_adjusted.or(state.last_rebuff);
+            if since.is_some_and(|at| now.duration_since(at) >= GROW_INTERVAL) {
+                state.limit += 1;
+                state.last_adjusted = Some(now);
+            }
         }
         state.limit
     }
@@ -307,6 +341,54 @@ mod tests {
         assert_eq!(reported.len(), 1, "only the governed model is reported");
         assert_eq!(reported[0].model, "busy");
         assert!(reported[0].limit > 0);
+    }
+
+    /// Observed live against NVIDIA: one episode of pressure fails every
+    /// in-flight request at once, and cutting on each rebuff ratcheted a model
+    /// 6 → 5 → 4 → 3 → 1 concurrent in seconds. Each cut shrinks in-flight,
+    /// which shrinks the next cut — a spiral to 1 that no amount of provider
+    /// capacity can escape.
+    #[test]
+    fn a_burst_of_rebuffs_from_one_episode_cuts_only_once() {
+        let g = governor();
+        let now = Instant::now();
+        let _held: Vec<_> = (0..8).map(|_| admit(&g, "m", now).unwrap()).collect();
+        for lane in 0..8 {
+            g.note_rebuff("m", lane, now);
+        }
+        assert_eq!(
+            g.limit("m", now),
+            4,
+            "eight rebuffs from one episode must halve once, not eight times"
+        );
+    }
+
+    #[test]
+    fn a_stable_model_climbs_back_one_permit_at_a_time() {
+        let g = governor();
+        let start = Instant::now();
+        let held: Vec<_> = (0..8).map(|_| admit(&g, "m", start).unwrap()).collect();
+        g.note_rebuff("m", 0, start);
+        g.note_rebuff("m", 1, start);
+        drop(held);
+        assert_eq!(g.limit("m", start), 4);
+
+        let after_one = start + GROW_INTERVAL + Duration::from_secs(1);
+        assert_eq!(
+            g.limit("m", after_one),
+            5,
+            "one stable interval, one permit"
+        );
+        let after_two = after_one + GROW_INTERVAL + Duration::from_secs(1);
+        assert_eq!(g.limit("m", after_two), 6);
+    }
+
+    #[test]
+    fn growth_does_not_resurrect_an_ungoverned_model() {
+        let g = governor();
+        let now = Instant::now();
+        let much_later = now + GROW_INTERVAL * 10;
+        assert_eq!(g.limit("never-seen", much_later), 0);
     }
 
     #[test]
