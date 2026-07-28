@@ -5,6 +5,7 @@ pub mod dispatch;
 pub mod governor;
 pub mod history;
 pub mod metrics;
+pub mod models;
 pub mod pool;
 pub mod proxy;
 pub mod setup;
@@ -44,6 +45,10 @@ pub struct AppState {
     /// Per-model concurrency gate for provider-side pressure that key failover
     /// cannot relieve.
     pub governor: Arc<governor::Governor>,
+    /// Cached per-provider model catalogs behind the merged `/v1/models`.
+    pub catalog: Arc<models::Catalog>,
+    /// Models observed to reject `stream_options`, so we stop adding it for them.
+    pub no_inject: Mutex<std::collections::HashSet<String>>,
     /// Content-blind request metrics (counts by client/model/status).
     pub metrics: metrics::Metrics,
     /// Persisted 5-minute snapshots for range views.
@@ -206,6 +211,7 @@ pub async fn run() {
         }
     };
     let setup_required = stored.superuser().is_none();
+    let models_ttl = stored.settings.models_ttl_secs;
 
     let history = Arc::new(history::History::load(
         Some(data_dir.join("history.jsonl")),
@@ -236,6 +242,8 @@ pub async fn run() {
         dispatch: dispatch::Dispatcher::new(pool.clone()),
         inflight: Arc::new(AtomicUsize::new(0)),
         governor: Arc::new(governor::Governor::default()),
+        catalog: Arc::new(models::Catalog::new(Duration::from_secs(models_ttl))),
+        no_inject: Mutex::new(std::collections::HashSet::new()),
         pool,
         http,
         provider_window,

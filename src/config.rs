@@ -110,6 +110,8 @@ pub struct Settings {
     pub history_days: u32,
     #[serde(default = "default_max_inflight")]
     pub max_inflight: usize,
+    #[serde(default = "default_models_ttl_secs")]
+    pub models_ttl_secs: u64,
 }
 
 fn default_history_days() -> u32 {
@@ -123,11 +125,18 @@ fn default_max_inflight() -> usize {
     512
 }
 
+/// How long a provider's model catalog is trusted. Catalogs change on the order
+/// of weeks, so this is about bounding staleness, not tracking churn.
+fn default_models_ttl_secs() -> u64 {
+    600
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             history_days: default_history_days(),
             max_inflight: default_max_inflight(),
+            models_ttl_secs: default_models_ttl_secs(),
         }
     }
 }

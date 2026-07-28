@@ -296,6 +296,67 @@ pub async fn start_pressured_mock() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// A mock provider serving a model catalog, counting how often it is asked.
+/// Lets a test prove catalog polls are answered from cache rather than forwarded.
+pub async fn start_catalog_mock(
+    model_id: &str,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let body = format!(r#"{{"object":"list","data":[{{"id":"{model_id}","object":"model"}}]}}"#);
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(move || {
+            let counter = counter.clone();
+            let body = body.clone();
+            async move {
+                counter.fetch_add(1, Ordering::Relaxed);
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://127.0.0.1:{port}"), hits)
+}
+
+/// A mock provider that rejects any request carrying `stream_options`, the way a
+/// model that doesn't support the field would. Everything else succeeds.
+pub async fn start_rejects_stream_options_mock() -> String {
+    use axum::response::IntoResponse;
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(|body: axum::body::Bytes| async move {
+            if String::from_utf8_lossy(&body).contains("stream_options") {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    r#"{"error":"unknown field stream_options"}"#,
+                )
+                    .into_response();
+            }
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"mock":"ok"}"#,
+            )
+                .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
 /// A mock provider that waits `delay` before answering — used to trip deadlines.
 pub async fn start_slow_mock(delay: Duration) -> String {
     let app = axum::Router::new().route(

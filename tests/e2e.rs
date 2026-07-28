@@ -438,6 +438,143 @@ async fn pressure_on_a_model_is_detected_across_keys_and_reported() {
 }
 
 #[tokio::test]
+async fn the_catalog_is_cached_and_lists_aliases_alongside_real_models() {
+    use sluice::auth::{hash_password, new_client_key};
+    use sluice::config::{
+        Alias, AliasTarget, Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION,
+    };
+    use std::sync::atomic::Ordering;
+
+    let (mock, upstream_hits) = support::start_catalog_mock("real-model").await;
+    let (client_secret, client_rec) = new_client_key("test", "admin");
+    let store = StoredConfig {
+        version: STORE_VERSION,
+        users: vec![User {
+            username: "admin".into(),
+            pw_hash: hash_password("password123"),
+            role: Role::Superuser,
+        }],
+        providers: vec![Provider {
+            name: "mock".into(),
+            base_url: mock.clone(),
+            keys: vec![ProviderKey {
+                key: "k".into(),
+                enabled: true,
+                rpm: 40,
+                owner: "admin".into(),
+            }],
+        }],
+        clients: vec![client_rec],
+        aliases: vec![Alias {
+            name: "my-virtual-model".into(),
+            targets: vec![AliasTarget {
+                provider: "mock".into(),
+                model: "real-model".into(),
+            }],
+        }],
+        settings: Default::default(),
+    };
+    let s = Server::start_seeded(&store, &[]).await;
+
+    let mut bodies = Vec::new();
+    for _ in 0..3 {
+        let r = s
+            .client
+            .get(format!("{}/v1/models", s.base_url))
+            .header("authorization", format!("Bearer {client_secret}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        bodies.push(r.json::<serde_json::Value>().await.unwrap());
+    }
+
+    assert_eq!(
+        upstream_hits.load(Ordering::Relaxed),
+        1,
+        "a harness polling its catalog must not spend rate budget every time"
+    );
+
+    let ids: Vec<&str> = bodies[0]["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"real-model"), "got {ids:?}");
+    assert!(
+        ids.contains(&"my-virtual-model"),
+        "an alias a harness can route to must be listed: {ids:?}"
+    );
+}
+
+async fn stream_once(s: &Server, key: &str, body: &'static str) -> String {
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    r.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn streaming_requests_ask_upstream_for_exact_token_counts() {
+    let mock = support::start_echo_mock().await;
+    let s = Server::start().await;
+    let key = s
+        .complete_wizard_get_key("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+
+    let echoed = stream_once(&s, &key, r#"{"model":"m","stream":true,"messages":[]}"#).await;
+    assert!(
+        echoed.contains("include_usage"),
+        "without this the stream reports no usage at all and tokens can only be \
+         guessed from frame counts; upstream saw: {echoed}"
+    );
+}
+
+#[tokio::test]
+async fn a_clients_own_stream_options_reaches_upstream_unchanged() {
+    let mock = support::start_echo_mock().await;
+    let s = Server::start().await;
+    let key = s
+        .complete_wizard_get_key("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+
+    let echoed = stream_once(
+        &s,
+        &key,
+        r#"{"model":"m","stream":true,"messages":[],"stream_options":{"include_usage":false}}"#,
+    )
+    .await;
+    assert!(
+        echoed.contains("\"include_usage\":false"),
+        "the client asked for no usage and meant it: {echoed}"
+    );
+}
+
+#[tokio::test]
+async fn a_model_rejecting_stream_options_still_gets_its_stream() {
+    let mock = support::start_rejects_stream_options_mock().await;
+    let s = Server::start().await;
+    let key = s
+        .complete_wizard_get_key("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+
+    let out = stream_once(&s, &key, r#"{"model":"picky","stream":true,"messages":[]}"#).await;
+    assert!(
+        out.contains("\"mock\":\"ok\""),
+        "a 400 we caused by adding stream_options must not become the client's \
+         error — it should be retried without the field: {out}"
+    );
+}
+
+#[tokio::test]
 async fn deadline_exceeded_returns_504() {
     let mock = support::start_slow_mock(Duration::from_secs(3)).await;
     let s = Server::start().await;

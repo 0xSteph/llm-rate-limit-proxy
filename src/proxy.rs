@@ -16,7 +16,7 @@ use axum::Json;
 
 use crate::config::Alias;
 use crate::dispatch::Permit;
-use crate::{auth, governor, AppState};
+use crate::{auth, governor, models, AppState};
 
 const HEARTBEAT: Duration = Duration::from_secs(15);
 
@@ -238,6 +238,26 @@ fn session_key(body: &Bytes) -> Option<u64> {
     Some(h.finish())
 }
 
+/// Ask the upstream to report exact token counts in the final SSE frame by
+/// setting `stream_options.include_usage`.
+///
+/// Without it a streamed response carries no usage at all and token figures have
+/// to be guessed from frame counts. Returns `None` when there is nothing to do:
+/// a body that isn't a JSON object, or one where the client already set
+/// `stream_options` — their choice wins over our accounting.
+fn inject_usage(body: &Bytes) -> Option<Bytes> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = v.as_object_mut()?;
+    if obj.contains_key("stream_options") {
+        return None;
+    }
+    obj.insert(
+        "stream_options".to_string(),
+        serde_json::json!({"include_usage": true}),
+    );
+    serde_json::to_vec(&v).ok().map(Bytes::from)
+}
+
 /// Return `body` with its `model` field replaced, or unchanged if there's no
 /// override or the body isn't a JSON object.
 fn rewrite_model(body: &Bytes, model: Option<&str>) -> Bytes {
@@ -276,6 +296,70 @@ fn build_request(
     }
     rb.header("authorization", format!("Bearer {}", permit.key))
         .body(body)
+}
+
+// --- Model catalog -----------------------------------------------------------
+
+/// Answer `/v1/models` by merging every provider's catalog with the configured
+/// aliases, refreshing any provider whose copy has expired.
+async fn serve_catalog(
+    state: &Arc<AppState>,
+    aliases: &[Alias],
+    deadline: Option<Instant>,
+) -> Response {
+    let providers: Vec<String> = {
+        let store = state.store.lock().unwrap();
+        store.providers.iter().map(|p| p.name.clone()).collect()
+    };
+
+    let mut catalogs = Vec::with_capacity(providers.len());
+    for provider in &providers {
+        if let Some(cached) = state.catalog.fresh(provider, Instant::now()) {
+            catalogs.push(cached);
+            continue;
+        }
+        match fetch_catalog(state, provider, deadline).await {
+            Some(models) => {
+                state.catalog.put(provider, models.clone(), Instant::now());
+                catalogs.push(models);
+            }
+            // One provider being unreachable must not blank the whole catalog:
+            // fall back to what we last saw, and simply omit a provider we have
+            // never reached.
+            None => {
+                if let Some(stale) = state.catalog.stale(provider) {
+                    catalogs.push(stale);
+                }
+            }
+        }
+    }
+
+    Json(models::merge(&catalogs, aliases)).into_response()
+}
+
+/// Fetch one provider's catalog. Takes a rate slot like any other upstream call
+/// — it is a real request against that key's budget, cache or not.
+async fn fetch_catalog(
+    state: &Arc<AppState>,
+    provider: &str,
+    deadline: Option<Instant>,
+) -> Option<Vec<serde_json::Value>> {
+    let permit = with_deadline(
+        deadline,
+        state.dispatch.acquire_for(Some(provider), &[], None),
+    )
+    .await??;
+    let resp = state
+        .http
+        .get(format!("{}/v1/models", permit.base_url))
+        .header("authorization", format!("Bearer {}", permit.key))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    Some(models::extract(&resp.json().await.ok()?))
 }
 
 // --- Entry point -------------------------------------------------------------
@@ -348,6 +432,15 @@ pub async fn handle(
         })
         .collect();
     let aliases = { state.store.lock().unwrap().aliases.clone() };
+
+    // Catalog requests are answered locally rather than forwarded. Forwarding
+    // would spend rate budget on a poll, return whichever provider won the lane,
+    // and hide every alias — which are routable names a harness can only learn
+    // about from here.
+    if method == Method::GET && uri.path() == "/v1/models" {
+        return serve_catalog(&state, &aliases, deadline).await;
+    }
+
     let requested = requested_model(&body);
     let model_label = requested.clone().unwrap_or_else(|| "unknown".to_string());
     let session = session_key(&body);
@@ -355,13 +448,23 @@ pub async fn handle(
     // Streaming: commit 200 text/event-stream now and drive the request in a worker
     // that heartbeats while it paces/retries, then relays the upstream SSE body.
     if wants_stream(&body) {
+        // Ask for exact token counts unless this model has already told us it
+        // rejects the field; keep the original so that can be undone per request.
+        let (out_body, fallback) = match state.no_inject.lock().unwrap().contains(&model_label) {
+            true => (body.clone(), None),
+            false => match inject_usage(&body) {
+                Some(injected) => (injected, Some(body.clone())),
+                None => (body.clone(), None),
+            },
+        };
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
         tokio::spawn(stream_proxy(
             state.clone(),
             rq_method,
             path_query,
             fwd_headers,
-            body,
+            out_body,
+            fallback,
             deadline,
             aliases,
             client,
@@ -562,7 +665,10 @@ async fn stream_proxy(
     rq_method: reqwest::Method,
     path_query: String,
     fwd_headers: Vec<(String, String)>,
-    body: Bytes,
+    mut body: Bytes,
+    // The client's original body, kept only while we have added `stream_options`
+    // to it, so the addition can be undone if this model rejects the field.
+    mut fallback: Option<Bytes>,
     deadline: Option<Instant>,
     aliases: Vec<Alias>,
     client: String,
@@ -581,6 +687,7 @@ async fn stream_proxy(
     let plan = resolve_plan(requested_model(&body).as_deref(), &aliases, pool_len);
     let last = plan.len().saturating_sub(1);
     let mut excluded: Vec<usize> = Vec::new();
+    let mut retried_plain = false;
     for (i, step) in plan.iter().enumerate() {
         let is_last = i == last;
         // Heartbeat while waiting on model pressure: the 200 is already committed,
@@ -610,23 +717,36 @@ async fn stream_proxy(
                 return;
             }
         };
-        let out_body = rewrite_model(&body, step.model.as_deref());
-        let send = build_request(
-            &state,
-            &permit,
-            &rq_method,
-            &path_query,
-            &fwd_headers,
-            out_body,
-        )
-        .send();
-        let sent = match with_deadline(deadline, send).await {
-            Some(r) => r,
-            None => {
-                state.metrics.record_request(&client, &model, "504");
-                let _ = tx.send(sse_error("deadline_exceeded")).await;
-                return;
+        let sent = loop {
+            let out_body = rewrite_model(&body, step.model.as_deref());
+            let send = build_request(
+                &state,
+                &permit,
+                &rq_method,
+                &path_query,
+                &fwd_headers,
+                out_body,
+            )
+            .send();
+            let sent = match with_deadline(deadline, send).await {
+                Some(r) => r,
+                None => {
+                    state.metrics.record_request(&client, &model, "504");
+                    let _ = tx.send(sse_error("deadline_exceeded")).await;
+                    return;
+                }
+            };
+            // A 400 right after we added `stream_options` points at this model
+            // rejecting the field. Retry this same step with the client's original
+            // body — a rejection we caused must not become the client's error.
+            if matches!(&sent, Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST)
+                && fallback.is_some()
+            {
+                body = fallback.take().expect("checked above");
+                retried_plain = true;
+                continue;
             }
+            break sent;
         };
         match sent {
             Ok(resp) => {
@@ -639,6 +759,12 @@ async fn stream_proxy(
                         excluded.push(permit.lane_idx);
                         continue;
                     }
+                }
+                // Only learn from a retry that actually worked. Recording the model
+                // on the 400 alone would blame our injection for a body the client
+                // simply got wrong, and permanently give up exact token counts.
+                if retried_plain && resp.status().is_success() {
+                    state.no_inject.lock().unwrap().insert(model.clone());
                 }
                 state.metrics.record_request(&client, &model, "200");
                 state.metrics.record_lane(&permit.provider);
@@ -716,6 +842,28 @@ mod tests {
             assert!(try_admit(&counter, 1).is_none());
         }
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn usage_injection_adds_include_usage() {
+        let out = inject_usage(&Bytes::from(r#"{"model":"m","stream":true}"#)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["stream_options"]["include_usage"], true);
+        assert_eq!(v["model"], "m", "the rest of the body is untouched");
+    }
+
+    /// A client that set `stream_options` itself meant it. Our token accounting
+    /// is not a good enough reason to overwrite what they asked for.
+    #[test]
+    fn usage_injection_leaves_a_clients_own_stream_options_alone() {
+        let body = Bytes::from(r#"{"model":"m","stream_options":{"include_usage":false}}"#);
+        assert!(inject_usage(&body).is_none());
+    }
+
+    #[test]
+    fn usage_injection_declines_bodies_it_cannot_parse() {
+        assert!(inject_usage(&Bytes::from("not json")).is_none());
+        assert!(inject_usage(&Bytes::from("[1,2,3]")).is_none());
     }
 
     #[test]
