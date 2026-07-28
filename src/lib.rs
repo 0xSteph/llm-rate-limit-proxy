@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod models;
 pub mod pool;
 pub mod proxy;
+pub mod settings;
 pub mod setup;
 
 use std::collections::HashMap;
@@ -277,6 +278,10 @@ pub async fn run() {
         .route("/api/history", get(api_history))
         .route("/api/stats", get(api_stats))
         .route("/api/pressure", get(api_pressure))
+        .route("/api/settings", get(settings::view))
+        .route("/api/settings/provider-keys", post(settings::provider_keys))
+        .route("/api/settings/clients", post(settings::clients))
+        .route("/api/settings/limits", post(settings::limits))
         .route("/dash/config.json", get(dash_config))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

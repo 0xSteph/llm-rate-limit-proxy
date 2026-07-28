@@ -124,6 +124,15 @@ impl Lane {
     pub fn load(&self, now: Instant) -> usize {
         self.limiter.lock().unwrap().load(now)
     }
+
+    /// Adopt another lane's spent budget and cooldown. Only the hits are copied,
+    /// not the limit, so a key whose rpm was just lowered is held to the new
+    /// figure immediately rather than from the next window.
+    fn carry_from(&self, old: &Lane) {
+        let hits = old.limiter.lock().unwrap().hits.clone();
+        self.limiter.lock().unwrap().hits = hits;
+        *self.cooldown_until.lock().unwrap() = *old.cooldown_until.lock().unwrap();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,6 +163,7 @@ pub fn lane_specs(sc: &StoredConfig) -> Vec<LaneSpec> {
 
 pub struct Pool {
     lanes: Vec<Lane>,
+    window: Duration,
 }
 
 impl Pool {
@@ -172,6 +182,36 @@ impl Pool {
     pub fn with_window(specs: Vec<LaneSpec>, window: Duration) -> Self {
         Self {
             lanes: specs.into_iter().map(|s| Lane::new(s, window)).collect(),
+            window,
+        }
+    }
+
+    /// Build a replacement pool, carrying each kept key's spent budget and
+    /// cooldown across the swap.
+    ///
+    /// Without this a settings save hands every key a fresh window, and the
+    /// requests immediately after it exceed the provider's limit — which is
+    /// precisely when someone is editing settings, because they are at capacity
+    /// and adding keys. A key is matched by provider and secret, so renaming or
+    /// reordering keeps its state and a genuinely new key starts clean.
+    pub fn rebuild(&self, specs: Vec<LaneSpec>) -> Self {
+        let lanes: Vec<Lane> = specs
+            .into_iter()
+            .map(|spec| {
+                let lane = Lane::new(spec, self.window);
+                if let Some(old) = self
+                    .lanes
+                    .iter()
+                    .find(|l| l.provider == lane.provider && l.key == lane.key)
+                {
+                    lane.carry_from(old);
+                }
+                lane
+            })
+            .collect();
+        Self {
+            lanes,
+            window: self.window,
         }
     }
 
@@ -376,6 +416,54 @@ mod tests {
         lane.bench(now + Duration::from_secs(30));
         lane.bench(now + Duration::from_secs(2));
         assert!(lane.benched(now + Duration::from_secs(10)));
+    }
+
+    /// A settings save must not hand every key a fresh rate window. Without
+    /// carryover, editing anything at all lets the very next requests exceed the
+    /// provider's limit — and editing settings is exactly what someone does while
+    /// they are already at capacity and trying to add keys.
+    #[test]
+    fn a_rebuilt_pool_keeps_each_kept_keys_spent_budget() {
+        let pool = Pool::with_window(specs(2), Duration::from_secs(60));
+        let now = Instant::now();
+        for _ in 0..3 {
+            pool.lanes()[0].try_acquire(now).unwrap();
+        }
+        assert_eq!(pool.lanes()[0].load(now), 3);
+
+        let rebuilt = pool.rebuild(specs(2));
+        assert_eq!(
+            rebuilt.lanes()[0].load(now),
+            3,
+            "the spent budget must survive the swap"
+        );
+        assert_eq!(
+            rebuilt.lanes()[1].load(now),
+            0,
+            "an untouched key is unaffected"
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_pool_keeps_a_benched_lane_benched() {
+        let pool = Pool::with_window(specs(1), Duration::from_secs(60));
+        let now = Instant::now();
+        pool.lanes()[0].bench(now + Duration::from_secs(30));
+        assert!(pool.rebuild(specs(1)).lanes()[0].benched(now));
+    }
+
+    #[test]
+    fn a_newly_added_key_starts_with_a_clean_window() {
+        let pool = Pool::with_window(specs(1), Duration::from_secs(60));
+        let now = Instant::now();
+        pool.lanes()[0].try_acquire(now).unwrap();
+        let grown = pool.rebuild(specs(2));
+        assert_eq!(
+            grown.lanes()[0].load(now),
+            1,
+            "the existing key carries over"
+        );
+        assert_eq!(grown.lanes()[1].load(now), 0, "the new key is fresh");
     }
 
     /// Affinity is keyed on lane identity, not lane index, so a pool rebuild that

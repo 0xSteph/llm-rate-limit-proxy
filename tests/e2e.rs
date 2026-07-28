@@ -574,6 +574,133 @@ async fn a_model_rejecting_stream_options_still_gets_its_stream() {
     );
 }
 
+// --- Runtime settings ---------------------------------------------------------
+
+async fn settings_post(s: &Server, path: &str, body: serde_json::Value) -> reqwest::Response {
+    s.client
+        .post(format!("{}{path}", s.base_url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn capacity_rpm(s: &Server) -> u64 {
+    let cfg: serde_json::Value = s.get("/dash/config.json").await.json().await.unwrap();
+    cfg["capacity_rpm"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn a_client_key_minted_through_settings_authenticates_immediately() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+    s.login("admin", "password123").await;
+
+    let r = settings_post(
+        &s,
+        "/api/settings/clients",
+        serde_json::json!({"action": "mint", "label": "laptop"}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let minted = r.json::<serde_json::Value>().await.unwrap();
+    let key = minted["key"].as_str().expect("a secret is returned once");
+
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {key}"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "onboarding a harness must not require a restart or a config file edit"
+    );
+}
+
+#[tokio::test]
+async fn adding_a_provider_key_raises_capacity_without_a_restart() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+    s.login("admin", "password123").await;
+
+    let before = capacity_rpm(&s).await;
+    let r = settings_post(
+        &s,
+        "/api/settings/provider-keys",
+        serde_json::json!({"action": "add", "provider": "mock", "key": "second-key", "rpm": 25}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+
+    assert_eq!(
+        capacity_rpm(&s).await,
+        before + 25,
+        "the live pool must pick up the new key"
+    );
+}
+
+#[tokio::test]
+async fn disabling_the_last_key_is_refused() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+    s.login("admin", "password123").await;
+
+    let r = settings_post(
+        &s,
+        "/api/settings/provider-keys",
+        serde_json::json!({"action": "update", "provider": "mock", "index": 0, "enabled": false}),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        400,
+        "one stray toggle must not silently take the data plane down"
+    );
+    assert!(
+        capacity_rpm(&s).await > 0,
+        "capacity is intact after the refusal"
+    );
+}
+
+#[tokio::test]
+async fn the_settings_view_never_returns_a_secret() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+    s.login("admin", "password123").await;
+
+    let body = s.get("/api/settings").await.text().await.unwrap();
+    assert!(
+        !body.contains("provider-key"),
+        "a settings page that renders live credentials is one screenshot from \
+         leaking them: {body}"
+    );
+    assert!(
+        body.contains("last4"),
+        "but it still identifies each key: {body}"
+    );
+}
+
+#[tokio::test]
+async fn settings_are_closed_to_anonymous_callers() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "mock", &mock, "provider-key")
+        .await;
+    assert_eq!(s.get_anon("/api/settings").await.status(), 303);
+}
+
 #[tokio::test]
 async fn deadline_exceeded_returns_504() {
     let mock = support::start_slow_mock(Duration::from_secs(3)).await;
