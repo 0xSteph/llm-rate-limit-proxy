@@ -192,10 +192,25 @@ async fn admit_model(
 /// path the proxy forwards verbatim, and the provider answers a bare 404 that
 /// names nothing. Seeing `/v1/v1/chat/completions` in the log is the difference
 /// between diagnosing that in seconds and guessing at it for an afternoon.
-fn record(state: &AppState, client: &str, model: &str, path: &str, status: &str, started: Instant) {
+fn record(
+    state: &AppState,
+    client: &str,
+    model: &str,
+    path: &str,
+    status: &str,
+    lane: Option<usize>,
+    started: Instant,
+) {
     state.metrics.record_request(client, model, status);
+    // Which key carried it. For a key-rotation proxy this is the one field that
+    // answers "is rotation actually spreading load", and its absence hides a
+    // pool quietly collapsing onto one key.
+    let key = match lane {
+        Some(i) => format!("key#{i}"),
+        None => "-".to_string(),
+    };
     println!(
-        "{status} {client} {model} {path} ({} ms)",
+        "{status} {client} {key} {model} {path} ({} ms)",
         started.elapsed().as_millis()
     );
 }
@@ -556,7 +571,7 @@ pub async fn handle(
         // yet shouldn't be holding a key's budget while it waits.
         let step_model = step.model.as_deref().unwrap_or(&model_label);
         let Some(_model_permit) = admit_model(&state, step_model, deadline, || true).await else {
-            record(&state, &client, &model_label, &path_query, "504", t0);
+            record(&state, &client, &model_label, &path_query, "504", None, t0);
             return deadline_exceeded();
         };
         let permit = match with_deadline(
@@ -568,7 +583,7 @@ pub async fn handle(
         .await
         {
             None => {
-                record(&state, &client, &model_label, &path_query, "504", t0);
+                record(&state, &client, &model_label, &path_query, "504", None, t0);
                 return deadline_exceeded();
             }
             Some(None) => continue, // no eligible lane for this target
@@ -588,7 +603,7 @@ pub async fn handle(
         let sent = match with_deadline(deadline, send).await {
             Some(r) => r,
             None => {
-                record(&state, &client, &model_label, &path_query, "504", t0);
+                record(&state, &client, &model_label, &path_query, "504", None, t0);
                 return deadline_exceeded();
             }
         };
@@ -619,6 +634,7 @@ pub async fn handle(
                     &model_label,
                     &path_query,
                     &status.to_string(),
+                    Some(permit.lane_idx),
                     t0,
                 );
                 state
@@ -632,7 +648,15 @@ pub async fn handle(
                     excluded.push(permit.lane_idx);
                     continue;
                 }
-                record(&state, &client, &model_label, &path_query, "502", t0);
+                record(
+                    &state,
+                    &client,
+                    &model_label,
+                    &path_query,
+                    "502",
+                    Some(permit.lane_idx),
+                    t0,
+                );
                 return err(
                     StatusCode::BAD_GATEWAY,
                     "upstream_error",
@@ -641,7 +665,7 @@ pub async fn handle(
             }
         }
     }
-    record(&state, &client, &model_label, &path_query, "503", t0);
+    record(&state, &client, &model_label, &path_query, "503", None, t0);
     err(
         StatusCode::SERVICE_UNAVAILABLE,
         "no_capacity",
@@ -777,7 +801,7 @@ async fn stream_proxy(
         let step_model = step.model.as_deref().unwrap_or(&model);
         let beat = || tx.try_send(heartbeat_frame()).is_ok() || !tx.is_closed();
         let Some(_model_permit) = admit_model(&state, step_model, deadline, beat).await else {
-            record(&state, &client, &model, &path_query, "504", t0);
+            record(&state, &client, &model, &path_query, "504", None, t0);
             let _ = tx.send(sse_error("deadline_exceeded")).await;
             return;
         };
@@ -794,7 +818,7 @@ async fn stream_proxy(
             Ok(Some(p)) => p,
             Ok(None) => continue,
             Err(()) => {
-                record(&state, &client, &model, &path_query, "504", t0);
+                record(&state, &client, &model, &path_query, "504", None, t0);
                 let _ = tx.send(sse_error("deadline_exceeded")).await;
                 return;
             }
@@ -813,7 +837,7 @@ async fn stream_proxy(
             let sent = match with_deadline(deadline, send).await {
                 Some(r) => r,
                 None => {
-                    record(&state, &client, &model, &path_query, "504", t0);
+                    record(&state, &client, &model, &path_query, "504", None, t0);
                     let _ = tx.send(sse_error("deadline_exceeded")).await;
                     return;
                 }
@@ -854,7 +878,15 @@ async fn stream_proxy(
                 if retried_plain && resp.status().is_success() {
                     state.no_inject.lock().unwrap().insert(model.clone());
                 }
-                record(&state, &client, &model, &path_query, "200", t0);
+                record(
+                    &state,
+                    &client,
+                    &model,
+                    &path_query,
+                    "200",
+                    Some(permit.lane_idx),
+                    t0,
+                );
                 state.metrics.record_lane(&permit.provider);
                 stream_body(resp, deadline, &tx).await;
                 return;
@@ -864,13 +896,21 @@ async fn stream_proxy(
                     excluded.push(permit.lane_idx);
                     continue;
                 }
-                record(&state, &client, &model, &path_query, "502", t0);
+                record(
+                    &state,
+                    &client,
+                    &model,
+                    &path_query,
+                    "502",
+                    Some(permit.lane_idx),
+                    t0,
+                );
                 let _ = tx.send(sse_error("upstream_error")).await;
                 return;
             }
         }
     }
-    record(&state, &client, &model, &path_query, "503", t0);
+    record(&state, &client, &model, &path_query, "503", None, t0);
     let _ = tx.send(sse_error("no_capacity")).await;
 }
 
