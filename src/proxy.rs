@@ -99,6 +99,26 @@ fn is_retryable(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
+/// Collapse a duplicated `/v1` prefix before forwarding.
+///
+/// Harnesses are configured with a base URL and their SDK appends the rest, and
+/// the two conventions disagree about who owns the `/v1`: some want it in the
+/// base, others prepend it themselves. Configure both and the client sends
+/// `/v1/v1/chat/completions`. Forwarded as-is that hits a provider route which
+/// doesn't exist, and the answer is a bare router "404 page not found" — plain
+/// text, naming nothing, indistinguishable from a missing model.
+///
+/// No provider routes a repeated version segment, so collapsing it is always
+/// what the caller meant, and being tolerant here costs a user nothing while
+/// saving them an afternoon.
+fn normalize_path(path_query: &str) -> String {
+    let mut out = path_query.to_string();
+    while let Some(rest) = out.strip_prefix("/v1/v1/") {
+        out = format!("/v1/{rest}");
+    }
+    out
+}
+
 /// Longest we honor a provider's `Retry-After`. Beyond this the value is more
 /// likely wrong than real, and obeying it would park a paid key for no reason.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -413,11 +433,7 @@ pub async fn handle(
 
     // Common request shape for both paths.
     let deadline = parse_deadline(&headers);
-    let path_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/v1")
-        .to_string();
+    let path_query = normalize_path(uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/v1"));
     let rq_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
     let fwd_headers: Vec<(String, String)> = headers
@@ -842,6 +858,44 @@ mod tests {
             assert!(try_admit(&counter, 1).is_none());
         }
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    /// The single most common harness misconfiguration. Two conventions disagree
+    /// about who owns the `/v1`: some SDKs want it in the base URL, others prepend
+    /// it themselves. Set both and the client sends `/v1/v1/chat/completions`,
+    /// which forwards to a provider route that does not exist and returns a bare
+    /// "404 page not found" naming nothing and pointing at nothing.
+    #[test]
+    fn a_doubled_version_prefix_is_collapsed() {
+        assert_eq!(
+            normalize_path("/v1/v1/chat/completions"),
+            "/v1/chat/completions"
+        );
+        assert_eq!(normalize_path("/v1/v1/v1/models"), "/v1/models");
+    }
+
+    #[test]
+    fn a_correct_path_is_left_alone() {
+        assert_eq!(
+            normalize_path("/v1/chat/completions"),
+            "/v1/chat/completions"
+        );
+        assert_eq!(normalize_path("/v1/models"), "/v1/models");
+    }
+
+    #[test]
+    fn collapsing_preserves_the_query_string() {
+        assert_eq!(
+            normalize_path("/v1/v1/models?limit=5"),
+            "/v1/models?limit=5"
+        );
+    }
+
+    /// Only a whole `/v1` segment counts — a path that merely starts with those
+    /// characters is a different route.
+    #[test]
+    fn a_similar_looking_segment_is_not_treated_as_a_duplicate() {
+        assert_eq!(normalize_path("/v1/v1beta/x"), "/v1/v1beta/x");
     }
 
     #[test]
