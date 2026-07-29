@@ -38,6 +38,11 @@ const DISSOLVE_AFTER: Duration = Duration::from_secs(10 * 60);
 /// provider would actually allow. One episode, one cut.
 const ADJUST_COOLDOWN: Duration = Duration::from_secs(5);
 
+/// Never cap a model below this. One permit serializes every caller behind a
+/// single request, which on a slow model is indistinguishable from an outage —
+/// and a provider that cannot serve two at once has a problem no gate fixes.
+const MIN_LIMIT: usize = 2;
+
 /// Additive increase: a model with no rebuff for this long gets one more permit.
 /// Cutting hard and climbing back slowly is what stops a transient blip from
 /// parking a model at a cap it no longer needs.
@@ -111,9 +116,16 @@ impl Governor {
             .last_adjusted
             .is_some_and(|at| now.duration_since(at) < ADJUST_COOLDOWN);
 
-        if state.implicated_keys() >= KEYS_TO_INDICT && !just_adjusted {
+        // A rebuff that lands while we are already under our own cap says nothing
+        // about the cap. Our gate was not the constraint, so the pressure came
+        // from elsewhere on a pool we share — and cutting for that lets one busy
+        // neighbour ratchet us to a standstill. Measured: without this the cap
+        // walked 75 -> 3 -> 1 over five minutes while throughput decayed with it.
+        let our_gate_was_binding = state.limit == 0 || state.inflight >= state.limit;
+
+        if state.implicated_keys() >= KEYS_TO_INDICT && !just_adjusted && our_gate_was_binding {
             let observed = state.inflight.max(1);
-            let backed_off = (observed / 2).max(1);
+            let backed_off = (observed / 2).max(MIN_LIMIT);
             let was = state.limit;
             state.limit = if state.limit == 0 {
                 backed_off
@@ -367,6 +379,60 @@ mod tests {
             g.limit("m", now),
             4,
             "eight rebuffs from one episode must halve once, not eight times"
+        );
+    }
+
+    /// Measured live over five minutes: a cap already down at 3 kept being cut
+    /// on rebuffs that arrived with only 2 in flight, reaching 1 and staying
+    /// there while throughput decayed 252 -> 12 rpm.
+    ///
+    /// A rebuff that arrives while we are *under* our own cap is not evidence
+    /// the cap is too generous — our gate was not the constraint. The provider's
+    /// pool is shared, so that pressure is somebody else's load, and cutting for
+    /// it means one busy neighbour can ratchet us to a standstill.
+    #[test]
+    fn pressure_below_the_cap_does_not_cut_further() {
+        let g = governor();
+        let start = Instant::now();
+        let held: Vec<_> = (0..8).map(|_| admit(&g, "m", start).unwrap()).collect();
+        g.note_rebuff("m", 0, start);
+        g.note_rebuff("m", 1, start);
+        assert_eq!(
+            g.limit("m", start),
+            4,
+            "first cut halves observed concurrency"
+        );
+        drop(held);
+
+        // Now only two requests are in flight — well under the cap of 4.
+        let _two: Vec<_> = (0..2).map(|_| admit(&g, "m", start).unwrap()).collect();
+        let later = start + ADJUST_COOLDOWN + Duration::from_secs(1);
+        g.note_rebuff("m", 2, later);
+        g.note_rebuff("m", 3, later);
+        assert_eq!(
+            g.limit("m", later),
+            4,
+            "our gate was not the constraint, so the cap must hold"
+        );
+    }
+
+    #[test]
+    fn a_cap_never_falls_below_the_floor() {
+        let g = governor();
+        let mut now = Instant::now();
+        // Drive it as hard as possible: always rebuff at exactly the cap.
+        for round in 0..12 {
+            let limit = g.limit("m", now).max(1);
+            let held: Vec<_> = (0..limit).filter_map(|_| admit(&g, "m", now)).collect();
+            g.note_rebuff("m", round * 2, now);
+            g.note_rebuff("m", round * 2 + 1, now);
+            drop(held);
+            now += ADJUST_COOLDOWN + Duration::from_secs(1);
+        }
+        assert!(
+            g.limit("m", now) >= MIN_LIMIT,
+            "collapsed to {}",
+            g.limit("m", now)
         );
     }
 
