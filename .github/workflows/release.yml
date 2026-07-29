@@ -1,0 +1,124 @@
+name: Release
+
+# Two cadences, deliberately different.
+#
+#   push to master  -> a rolling ghcr.io/OWNER/sluice:edge image
+#   push of a v* tag -> a versioned image plus binaries on a GitHub Release
+#
+# Cutting a release per commit would mean hundreds of versions and no way to say
+# "run the stable one". Tags are the statement that a commit is meant to be run.
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+
+permissions:
+  contents: write # attach binaries to the release
+  packages: write # push to GHCR
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # Nothing ships that hasn't passed the same gates as any other commit.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  image:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # arm64 is emulated here. Slower to build, but it means a Raspberry Pi or
+      # an ARM VPS can run this without anyone cross-compiling by hand.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Binaries for people who would rather not run Docker. Extracted from the
+  # images just built, so the binary someone downloads is bit-identical to the
+  # one in the container rather than a separately-built lookalike.
+  binaries:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract the binary from each published image
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          image="${REGISTRY}/${GITHUB_REPOSITORY,,}:${version}"
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            cid=$(docker create --platform "linux/${arch}" "$image")
+            docker cp "${cid}:/sluice" "dist/sluice-${arch}"
+            docker rm "$cid" >/dev/null
+            tar -czf "dist/sluice-${version}-linux-${arch}.tar.gz" -C dist "sluice-${arch}"
+            rm "dist/sluice-${arch}"
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          ls -la dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "sluice $version" \
+            --generate-notes \
+            --notes "
+          ## Install
+
+          Container (recommended):
+
+              docker run -d --name sluice -p 127.0.0.1:8000:8000 \\
+                -v sluice-data:/data ghcr.io/${GITHUB_REPOSITORY,,}:${version}
+
+          Then open http://localhost:8000 and complete the setup wizard.
+
+          Or a binary — verify it first:
+
+              sha256sum -c SHA256SUMS --ignore-missing
+          "

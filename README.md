@@ -62,13 +62,45 @@ already have.
 - `/api/pressure` reports models held back by provider-side limits, so a stalled
   agent is never mistaken for an idle proxy
 
-## Running it
+## Install
+
+**Container** — the intended path:
 
 ```sh
-docker compose up -d          # published to 127.0.0.1:8000 only
-# or
+docker run -d --name sluice \
+  -p 127.0.0.1:8000:8000 \
+  -v sluice-data:/data \
+  ghcr.io/0xsteph/sluice:latest
+```
+
+Or with compose, which also applies the hardening (read-only root, no
+capabilities, loopback publish):
+
+```sh
+docker compose up -d
+```
+
+**Binary** — attached to each release for `linux/amd64` and `linux/arm64`:
+
+```sh
+curl -fsSLO https://github.com/0xSteph/sluice/releases/latest/download/SHA256SUMS
+curl -fsSLO https://github.com/0xSteph/sluice/releases/latest/download/sluice-VERSION-linux-amd64.tar.gz
+sha256sum -c SHA256SUMS --ignore-missing
+tar xzf sluice-*-linux-amd64.tar.gz && ./sluice-amd64
+```
+
+The binary is extracted from the published image rather than built separately,
+so it is the same bytes that run in the container.
+
+**From source:**
+
+```sh
 cargo run --release
 ```
+
+Images are published on every push to `master` as `:edge`, and on a version tag
+as `:1.2.3`, `:1.2` and `:latest`. `:edge` is whatever just landed; tags are the
+statement that a commit is meant to be run.
 
 Then open `http://localhost:8000/`. The first visitor claims the install: create
 the admin account, add one provider key, and the wizard mints your first client
