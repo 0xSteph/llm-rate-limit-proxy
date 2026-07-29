@@ -41,6 +41,13 @@ const ADJUST_COOLDOWN: Duration = Duration::from_secs(5);
 /// Additive increase: a model with no rebuff for this long gets one more permit.
 /// Cutting hard and climbing back slowly is what stops a transient blip from
 /// parking a model at a cap it no longer needs.
+///
+/// Growth is evaluated lazily, when a request asks for a permit, so this is one
+/// permit per minute *of traffic* rather than of wall clock. Under load that is
+/// the same thing; on an idle model nothing grows, which costs nothing because
+/// an idle model is not waiting on the cap, and a long enough silence dissolves
+/// it outright. Measured live: a model cut to 20 sat at 20 while it drained,
+/// then rose to 21.
 const GROW_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
