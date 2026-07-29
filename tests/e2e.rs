@@ -1132,3 +1132,117 @@ async fn dashboard_and_stats_served_after_login() {
     assert_eq!(c.status(), 200);
     assert!(c.text().await.unwrap().contains("capacity_rpm"));
 }
+
+// --- Authorization: session is not the same as permission ---------------------
+
+/// Seed a proxy with an admin and a plain user, returning the server.
+async fn server_with_plain_user(mock: &str) -> Server {
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "main", mock, "k1")
+        .await;
+    s.login("admin", "password123").await;
+    settings_post(
+        &s,
+        "/api/settings/users",
+        serde_json::json!({"action": "add", "username": "plain", "password": "correcthorsebattery"}),
+    )
+    .await;
+    s.logout().await;
+    s
+}
+
+/// A logged-in account is not an administrator. Without this the weakest
+/// password on the box is a route to every provider key the pool holds.
+#[tokio::test]
+async fn a_plain_user_cannot_change_server_configuration() {
+    let mock = support::start_mock_upstream().await;
+    let s = server_with_plain_user(&mock).await;
+    assert_eq!(s.login("plain", "correcthorsebattery").await.status(), 303);
+
+    for (path, body) in [
+        (
+            "/api/settings/provider-keys",
+            serde_json::json!({"action": "add", "provider": "main", "key": "stolen", "rpm": 40}),
+        ),
+        (
+            "/api/settings/providers",
+            serde_json::json!({"action": "remove", "name": "main"}),
+        ),
+        (
+            "/api/settings/limits",
+            serde_json::json!({"max_inflight": 1}),
+        ),
+        (
+            "/api/settings/users",
+            serde_json::json!({"action": "add", "username": "mine", "password": "correcthorsebattery"}),
+        ),
+    ] {
+        let r = settings_post(&s, path, body).await;
+        assert_eq!(r.status(), 403, "{path} was not admin-guarded");
+    }
+}
+
+/// The shared-pool case still has to work: someone who contributes a key gets
+/// their own client credential without being handed the whole server.
+#[tokio::test]
+async fn a_plain_user_may_still_mint_their_own_client_key() {
+    let mock = support::start_mock_upstream().await;
+    let s = server_with_plain_user(&mock).await;
+    s.login("plain", "correcthorsebattery").await;
+
+    let r = settings_post(
+        &s,
+        "/api/settings/clients",
+        serde_json::json!({"action": "mint", "label": "laptop"}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let key = r.json::<serde_json::Value>().await.unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let used = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {key}"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(used.status(), 200, "their own key must work");
+}
+
+/// One user must not be able to revoke another's credential.
+#[tokio::test]
+async fn a_plain_user_cannot_revoke_someone_elses_client_key() {
+    let mock = support::start_mock_upstream().await;
+    let s = server_with_plain_user(&mock).await;
+
+    s.login("admin", "password123").await;
+    let minted = settings_post(
+        &s,
+        "/api/settings/clients",
+        serde_json::json!({"action": "mint", "label": "admins-own"}),
+    )
+    .await
+    .json::<serde_json::Value>()
+    .await
+    .unwrap();
+    let victim_last4 =
+        minted["key"].as_str().unwrap()[minted["key"].as_str().unwrap().len() - 4..].to_string();
+    s.logout().await;
+
+    s.login("plain", "correcthorsebattery").await;
+    let r = settings_post(
+        &s,
+        "/api/settings/clients",
+        serde_json::json!({"action": "revoke", "last4": victim_last4}),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        403,
+        "revoking another user's key must be refused"
+    );
+}

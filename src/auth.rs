@@ -225,13 +225,61 @@ pub async fn require_session(
         .headers()
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok());
-    let authed = session_from_cookies(cookie)
-        .and_then(|t| state.admin.verify(&t))
-        .is_some();
-    if authed {
+    let who = session_from_cookies(cookie).and_then(|t| state.admin.verify(&t));
+    match who {
+        Some(username) => {
+            // Carry the identity forward. Discarding it here is what let every
+            // logged-in account act with full authority: a handler that cannot
+            // tell who is calling cannot refuse anybody.
+            let mut req = req;
+            req.extensions_mut().insert(SessionUser(username));
+            next.run(req).await
+        }
+        None => Redirect::to("/login").into_response(),
+    }
+}
+
+/// The authenticated operator, attached by [`require_session`].
+#[derive(Clone, Debug)]
+pub struct SessionUser(pub String);
+
+impl SessionUser {
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Guard for routes that change server-wide configuration.
+///
+/// A session proves who someone is, not what they may do. Without this the
+/// weakest password on the box is a route to every provider key in the pool.
+pub async fn require_admin(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let is_admin = req
+        .extensions()
+        .get::<SessionUser>()
+        .and_then(|u| {
+            let store = state.store.lock().unwrap();
+            store
+                .users
+                .iter()
+                .find(|x| x.username == u.0)
+                .map(|x| x.role.is_admin())
+        })
+        .unwrap_or(false);
+    if is_admin {
         next.run(req).await
     } else {
-        Redirect::to("/login").into_response()
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": {"message": "administrator role required", "code": "forbidden"}
+            })),
+        )
+            .into_response()
     }
 }
 

@@ -11,11 +11,29 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::{auth, config, pool, AppState};
+
+fn forbidden(message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": {"message": message, "code": "forbidden"}})),
+    )
+        .into_response()
+}
+
+fn is_admin(state: &AppState, username: &str) -> bool {
+    let store = state.store.lock().unwrap();
+    store
+        .users
+        .iter()
+        .find(|u| u.username == username)
+        .is_some_and(|u| u.role.is_admin())
+}
 
 fn bad_request(message: &str) -> Response {
     (
@@ -50,7 +68,12 @@ fn apply(state: &Arc<AppState>) -> Result<(), String> {
 /// they have to be sent upstream, but nothing needs to render them back, and a
 /// settings page that displays live credentials is a screenshot away from
 /// leaking them.
-pub async fn view(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+pub async fn view(
+    State(state): State<Arc<AppState>>,
+    Extension(who): Extension<auth::SessionUser>,
+) -> Json<serde_json::Value> {
+    let admin = is_admin(&state, who.name());
+    let me = who.name().to_string();
     let store = state.store.lock().unwrap();
     Json(json!({
         "providers": store.providers.iter().map(|p| json!({
@@ -63,13 +86,13 @@ pub async fn view(State(state): State<Arc<AppState>>) -> Json<serde_json::Value>
                 "owner": k.owner,
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
-        "clients": store.clients.iter().map(|c| json!({
+        "clients": store.clients.iter().filter(|c| admin || c.owner == me).map(|c| json!({
             "label": c.label,
             "last4": c.last4,
             "owner": c.owner,
         })).collect::<Vec<_>>(),
         "aliases": store.aliases,
-        "users": store.users.iter().map(|u| json!({
+        "users": store.users.iter().filter(|_| admin).map(|u| json!({
             "username": u.username,
             "role": u.role,
         })).collect::<Vec<_>>(),
@@ -365,8 +388,10 @@ pub enum ClientAction {
 /// file, to read an existing key back out.
 pub async fn clients(
     State(state): State<Arc<AppState>>,
+    Extension(who): Extension<auth::SessionUser>,
     Json(action): Json<ClientAction>,
 ) -> Response {
+    let admin = is_admin(&state, who.name());
     let mut store = state.store.lock().unwrap();
     let minted = match action {
         ClientAction::Mint { label } => {
@@ -374,16 +399,22 @@ pub async fn clients(
             if label.is_empty() {
                 return bad_request("label must not be empty");
             }
-            let (secret, record) = auth::new_client_key(&label, "");
+            // Stamped with the caller so revocation can be scoped, and so a
+            // shared pool can tell whose credential is whose.
+            let (secret, record) = auth::new_client_key(&label, who.name());
             store.clients.push(record);
             Some(secret)
         }
         ClientAction::Revoke { last4 } => {
-            let before = store.clients.len();
-            store.clients.retain(|c| c.last4 != last4);
-            if store.clients.len() == before {
+            let Some(target) = store.clients.iter().find(|c| c.last4 == last4) else {
                 return bad_request("no client key ending in that");
+            };
+            // Anyone may retire their own credential; only an admin may retire
+            // somebody else's.
+            if target.owner != who.name() && !admin {
+                return forbidden("that client key belongs to another user");
             }
+            store.clients.retain(|c| c.last4 != last4);
             None
         }
     };

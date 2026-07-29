@@ -271,6 +271,18 @@ pub async fn run() {
         });
     }
 
+    // Anything that reshapes the server itself is administrator-only.
+    let admin_only = Router::new()
+        .route("/api/settings/providers", post(settings::providers))
+        .route("/api/settings/provider-keys", post(settings::provider_keys))
+        .route("/api/settings/aliases", post(settings::aliases))
+        .route("/api/settings/limits", post(settings::limits))
+        .route("/api/settings/users", post(settings::users))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_admin,
+        ));
+
     let protected = Router::new()
         .route("/", get(root))
         .route("/dash", get(root))
@@ -279,12 +291,11 @@ pub async fn run() {
         .route("/api/stats", get(api_stats))
         .route("/api/pressure", get(api_pressure))
         .route("/api/settings", get(settings::view))
-        .route("/api/settings/providers", post(settings::providers))
-        .route("/api/settings/provider-keys", post(settings::provider_keys))
-        .route("/api/settings/aliases", post(settings::aliases))
+        // Minting and revoking a client credential is self-service: someone who
+        // contributes a key needs their own bearer token without being handed
+        // the server. Ownership is enforced inside the handler.
         .route("/api/settings/clients", post(settings::clients))
-        .route("/api/settings/limits", post(settings::limits))
-        .route("/api/settings/users", post(settings::users))
+        .merge(admin_only)
         .route("/dash/config.json", get(dash_config))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
