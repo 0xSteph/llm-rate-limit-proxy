@@ -1365,3 +1365,68 @@ async fn a_doubled_prefix_still_reaches_the_local_catalog() {
         "the doubled path was forwarded upstream instead of served from cache"
     );
 }
+
+// --- Scrapeable metrics -------------------------------------------------------
+
+/// A metrics endpoint only a browser can read is not a metrics endpoint. It has
+/// to answer a scraper carrying credentials, with a status rather than a login
+/// page — Prometheus cannot follow a redirect into HTML and report anything.
+#[tokio::test]
+async fn prometheus_can_scrape_metrics_with_credentials() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "main", &mock, "k1")
+        .await;
+
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let bare = anon
+        .get(format!("{}/metrics", s.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bare.status(),
+        401,
+        "a scraper needs a status, not a redirect"
+    );
+
+    let good = anon
+        .get(format!("{}/metrics", s.base_url))
+        .basic_auth("admin", Some("password123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(good.status(), 200);
+    assert!(good.text().await.unwrap().contains("sluice_requests_total"));
+
+    let wrong = anon
+        .get(format!("{}/metrics", s.base_url))
+        .basic_auth("admin", Some("nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401);
+
+    let no_such_user = anon
+        .get(format!("{}/metrics", s.base_url))
+        .basic_auth("ghost", Some("password123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_such_user.status(), 401);
+}
+
+/// A logged-in operator should still be able to eyeball it in a browser.
+#[tokio::test]
+async fn a_session_still_reaches_metrics() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "main", &mock, "k1")
+        .await;
+    s.login("admin", "password123").await;
+    assert_eq!(s.get("/metrics").await.status(), 200);
+}

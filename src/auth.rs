@@ -11,7 +11,7 @@ use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Form;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
@@ -271,6 +271,69 @@ pub struct SessionUser(pub String);
 impl SessionUser {
     pub fn name(&self) -> &str {
         &self.0
+    }
+}
+
+/// Guard for the metrics endpoint: a session, or credentials a scraper can
+/// carry.
+///
+/// Prometheus cannot follow a redirect into a login page and report anything
+/// useful, so this answers 401 rather than bouncing to `/login`. Credentials are
+/// any operator account, over HTTP Basic — the same identities that can read the
+/// console, since the numbers are the same numbers.
+pub async fn require_session_or_basic(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if state.setup_required.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "setup required").into_response();
+    }
+    let headers = req.headers();
+    let by_session =
+        session_from_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()))
+            .and_then(|t| state.admin.verify(&t))
+            .is_some_and(|(username, witness)| {
+                let store = state.store.lock().unwrap();
+                store
+                    .users
+                    .iter()
+                    .find(|u| u.username == username)
+                    .is_some_and(|u| Admin::pw_witness(&u.pw_hash) == witness)
+            });
+
+    let by_basic = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|b| {
+            URL_SAFE_NO_PAD
+                .decode(b)
+                .ok()
+                .or_else(|| STANDARD.decode(b).ok())
+        })
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .and_then(|pair| {
+            let (user, pass) = pair.split_once(':')?;
+            let store = state.store.lock().unwrap();
+            let ok = store
+                .users
+                .iter()
+                .find(|u| u.username == user)
+                .is_some_and(|u| verify_password(pass, &u.pw_hash));
+            ok.then_some(())
+        })
+        .is_some();
+
+    if by_session || by_basic {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"sluice metrics\"")],
+            "credentials required",
+        )
+            .into_response()
     }
 }
 

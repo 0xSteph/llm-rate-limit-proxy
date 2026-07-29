@@ -285,7 +285,6 @@ pub async fn run() {
     let protected = Router::new()
         .route("/", get(root))
         .route("/dash", get(root))
-        .route("/metrics", get(metrics_handler))
         .route("/api/history", get(api_history))
         .route("/api/stats", get(api_stats))
         .route("/api/pressure", get(api_pressure))
@@ -301,8 +300,18 @@ pub async fn run() {
             auth::require_session,
         ));
 
+    // Scrapeable with either a session or operator credentials, and answering
+    // 401 rather than redirecting, because Prometheus cannot use a login page.
+    let observability = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session_or_basic,
+        ));
+
     let app = Router::new()
         .merge(protected)
+        .merge(observability)
         .route("/health", get(|| async { "ok" }))
         .route("/login", get(auth::login_page).post(auth::login_submit))
         .route("/logout", post(auth::logout))

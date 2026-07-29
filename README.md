@@ -93,6 +93,45 @@ cargo test --test load -- --ignored   # 100 concurrent clients, asserts zero
                                       # upstream rate violations
 ```
 
+## Operations
+
+### Monitoring
+
+`GET /metrics` serves Prometheus text. It accepts either a console session or
+HTTP Basic with any operator account, and answers `401` rather than redirecting,
+because a scraper cannot follow a redirect into a login page.
+
+```yaml
+scrape_configs:
+  - job_name: sluice
+    basic_auth: { username: admin, password: your-password }
+    static_configs: [{ targets: ["localhost:8000"] }]
+```
+
+`GET /health` needs no credentials and exposes nothing — it exists for load
+balancers and container probes.
+
+### Backup
+
+Everything that matters is one file: `DATA_DIR/config.json`. It holds your
+provider keys, the digests of every client key, operator password hashes,
+aliases and settings. Lose it and you re-enter every key by hand.
+
+```sh
+install -m 600 /path/to/data/config.json /somewhere/safe/config.json
+```
+
+It is mode `0600` and contains live credentials — back it up somewhere with at
+least the same protection as the machine it came from.
+
+`history.jsonl` alongside it is metrics snapshots only. Losing it costs you the
+range views and nothing else.
+
+To restore, drop the file into an empty `DATA_DIR` and start. No import step and
+no re-setup: the wizard stays closed because a superuser already exists.
+Verified — a restored instance came back with all 13 lanes, the original
+password, and previously minted client keys still working.
+
 ## Security posture
 
 - Binds loopback by default. This process holds every provider key and
