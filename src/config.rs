@@ -157,8 +157,20 @@ impl StoredConfig {
 /// mistake people actually make, and what comes back is a bare router 404
 /// ("404 page not found") that names nothing and points at nothing.
 pub fn normalize_base_url(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches('/');
-    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
+    // Applied until it stops changing. Each rule can expose input for another —
+    // a trailing slash hides whitespace from the trim, and stripping "/v1" can
+    // reveal a slash underneath — so a single pass leaves results that are not
+    // normal, and storing one bakes stray whitespace into every request URL
+    // built from it.
+    let mut out = raw;
+    loop {
+        let next = out.trim().trim_end_matches('/').trim();
+        let next = next.strip_suffix("/v1").unwrap_or(next);
+        if next == out {
+            return out.to_string();
+        }
+        out = next;
+    }
 }
 
 pub fn store_path(dir: &Path) -> PathBuf {
