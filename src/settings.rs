@@ -532,8 +532,13 @@ pub struct LimitsReq {
     pub history_days: Option<u32>,
 }
 
-/// Update operational limits. `max_inflight` and `models_ttl_secs` are read per
-/// request, so they take effect immediately.
+/// Update operational limits.
+///
+/// All three take effect immediately, by three different routes: `max_inflight`
+/// is read from the store on each request, while the catalog TTL and history
+/// retention are pushed into the components that own them. The comment here
+/// used to claim the first mechanism covered all of them, which was wrong for
+/// two of the three.
 pub async fn limits(State(state): State<Arc<AppState>>, Json(req): Json<LimitsReq>) -> Response {
     let snapshot = {
         let mut store = state.store.lock().unwrap();
@@ -545,6 +550,7 @@ pub async fn limits(State(state): State<Arc<AppState>>, Json(req): Json<LimitsRe
         }
         if let Some(v) = req.models_ttl_secs {
             store.settings.models_ttl_secs = v;
+            state.catalog.set_ttl_secs(v);
         }
         if let Some(v) = req.history_days {
             store.settings.history_days = v;

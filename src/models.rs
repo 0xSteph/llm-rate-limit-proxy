@@ -8,6 +8,7 @@
 //! catalog — otherwise a harness listing models never discovers them.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -22,23 +23,31 @@ struct Entry {
 }
 
 pub struct Catalog {
-    ttl: Duration,
+    /// Atomic so a settings change takes effect on the next lookup rather than
+    /// at the next restart — the console offers this as a live setting.
+    ttl_secs: AtomicU64,
     entries: Mutex<HashMap<String, Entry>>,
 }
 
 impl Catalog {
     pub fn new(ttl: Duration) -> Self {
         Self {
-            ttl,
+            ttl_secs: AtomicU64::new(ttl.as_secs()),
             entries: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Change how long a catalog is trusted, effective on the next lookup.
+    pub fn set_ttl_secs(&self, secs: u64) {
+        self.ttl_secs.store(secs, Ordering::Relaxed);
     }
 
     /// The provider's catalog if it is still fresh.
     pub fn fresh(&self, provider: &str, now: Instant) -> Option<Vec<Value>> {
         let entries = self.entries.lock().unwrap();
         let entry = entries.get(provider)?;
-        (now.duration_since(entry.fetched) < self.ttl).then(|| entry.models.clone())
+        let ttl = Duration::from_secs(self.ttl_secs.load(Ordering::Relaxed));
+        (now.duration_since(entry.fetched) < ttl).then(|| entry.models.clone())
     }
 
     /// The provider's catalog at any age.
@@ -215,6 +224,18 @@ mod tests {
         assert_eq!(cat.providers_offering("shared"), vec!["nim", "together"]);
         assert_eq!(cat.providers_offering("nim-only"), vec!["nim"]);
         assert!(cat.providers_offering("nowhere").is_empty());
+    }
+
+    /// Offered as a live setting, so it has to behave like one.
+    #[test]
+    fn shortening_the_ttl_expires_a_catalog_immediately() {
+        let cat = Catalog::new(Duration::from_secs(600));
+        let start = Instant::now();
+        cat.put("nim", vec![model("a")], start);
+        let later = start + Duration::from_secs(60);
+        assert!(cat.fresh("nim", later).is_some(), "fresh under a 600s ttl");
+        cat.set_ttl_secs(30);
+        assert!(cat.fresh("nim", later).is_none(), "stale under a 30s ttl");
     }
 
     #[test]
