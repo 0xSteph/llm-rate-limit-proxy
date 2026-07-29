@@ -548,6 +548,7 @@ pub async fn limits(State(state): State<Arc<AppState>>, Json(req): Json<LimitsRe
         }
         if let Some(v) = req.history_days {
             store.settings.history_days = v;
+            state.history.set_retention_days(v);
         }
         store.clone()
     };

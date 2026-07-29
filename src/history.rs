@@ -3,6 +3,7 @@
 //! retention window are pruned on each append.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,10 @@ pub struct Snapshot {
 
 pub struct History {
     path: Option<PathBuf>,
-    retention_secs: u64,
+    /// Atomic so a settings change takes effect on the next snapshot. Every
+    /// other setting applies live; this one silently needed a restart, which is
+    /// worse than not being settable at all.
+    retention_secs: AtomicU64,
     snapshots: RwLock<Vec<Snapshot>>,
 }
 
@@ -45,9 +49,20 @@ impl History {
         }
         History {
             path,
-            retention_secs,
+            retention_secs: AtomicU64::new(retention_secs),
             snapshots: RwLock::new(snapshots),
         }
+    }
+
+    /// Change the retention window at runtime. Takes effect on the next append,
+    /// which also prunes anything the new, shorter window excludes.
+    pub fn set_retention_days(&self, days: u32) {
+        let secs = if days == 0 {
+            u64::MAX
+        } else {
+            days as u64 * 86_400
+        };
+        self.retention_secs.store(secs, Ordering::Relaxed);
     }
 
     /// Append a snapshot, prune expired ones, and persist. Retention keeps the file
@@ -55,7 +70,7 @@ impl History {
     pub fn append(&self, t: u64, total: u64) {
         let mut snaps = self.snapshots.write().unwrap();
         snaps.push(Snapshot { t, total });
-        let cutoff = t.saturating_sub(self.retention_secs);
+        let cutoff = t.saturating_sub(self.retention_secs.load(Ordering::Relaxed));
         snaps.retain(|s| s.t >= cutoff);
         if let Some(p) = &self.path {
             let mut out = String::new();
@@ -103,6 +118,21 @@ mod tests {
         assert_eq!(all[1].total, 9);
         // Range filtering.
         assert_eq!(h.range(150, 1000, 100).len(), 1);
+    }
+
+    /// Retention is offered as a live setting, so it has to behave like one.
+    #[test]
+    fn shortening_retention_prunes_on_the_next_append() {
+        let h = History::load(None, 0); // keep forever
+        h.append(1_000, 1);
+        h.append(200_000, 2);
+        assert_eq!(h.range(0, u64::MAX, 100).len(), 2);
+
+        h.set_retention_days(1); // 86400s
+        h.append(200_001, 3);
+        let kept = h.range(0, u64::MAX, 100);
+        assert_eq!(kept.len(), 2, "the 1_000s snapshot is now out of window");
+        assert_eq!(kept[0].t, 200_000);
     }
 
     #[test]
