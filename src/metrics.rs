@@ -13,6 +13,19 @@ use serde::Serialize;
 /// to `other`.
 const MAX_SERIES: usize = 500;
 
+/// Keep a client-supplied label, or fold it into "other" once a map is full.
+///
+/// Model names arrive in the request body, so any map keyed on one grows as far
+/// as a caller cares to push it. Every such map needs this, not just the first
+/// one somebody remembered.
+fn capped<V>(map: &HashMap<String, V>, label: String) -> String {
+    if map.contains_key(&label) || map.len() < MAX_SERIES {
+        label
+    } else {
+        "other".to_string()
+    }
+}
+
 #[derive(Default)]
 pub struct Metrics {
     /// (client, model, status) -> count
@@ -39,14 +52,16 @@ impl Metrics {
 
     pub fn record_latency(&self, model: &str, ms: u64) {
         let mut m = self.latency.lock().unwrap();
-        let e = m.entry(sanitize(model)).or_insert((0, 0));
+        let key = capped(&m, sanitize(model));
+        let e = m.entry(key).or_insert((0, 0));
         e.0 += ms;
         e.1 += 1;
     }
 
     pub fn record_tokens(&self, model: &str, prompt: u64, completion: u64) {
         let mut m = self.tokens.lock().unwrap();
-        let e = m.entry(sanitize(model)).or_insert((0, 0));
+        let key = capped(&m, sanitize(model));
+        let e = m.entry(key).or_insert((0, 0));
         e.0 += prompt;
         e.1 += completion;
     }
@@ -243,6 +258,28 @@ mod tests {
             .count();
         assert!(series <= MAX_SERIES + 1, "series not capped: {series}");
         assert!(m.render().contains(r#"model="other""#));
+    }
+
+    /// The model label comes straight out of a client's request body, so every
+    /// map keyed on it is a memory-growth vector reachable by anyone holding a
+    /// client key. `record_request` was capped and these two were not.
+    #[test]
+    fn latency_and_token_series_are_capped_too() {
+        let m = Metrics::default();
+        for i in 0..(MAX_SERIES + 200) {
+            m.record_latency(&format!("model-{i}"), 10);
+            m.record_tokens(&format!("model-{i}"), 1, 1);
+        }
+        assert!(
+            m.latency.lock().unwrap().len() <= MAX_SERIES + 1,
+            "latency map grew to {}",
+            m.latency.lock().unwrap().len()
+        );
+        assert!(
+            m.tokens.lock().unwrap().len() <= MAX_SERIES + 1,
+            "token map grew to {}",
+            m.tokens.lock().unwrap().len()
+        );
     }
 
     #[test]

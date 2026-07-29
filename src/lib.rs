@@ -1,5 +1,4 @@
 pub mod auth;
-pub mod cache;
 pub mod config;
 pub mod dispatch;
 pub mod governor;
