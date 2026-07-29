@@ -1297,3 +1297,27 @@ async fn changing_a_password_invalidates_that_users_existing_sessions() {
         "a reset password must not leave the old session usable"
     );
 }
+
+/// The settings API existing is not the same as an operator being able to use
+/// it. Every route needs a control, or configuration stays a curl command.
+#[tokio::test]
+async fn the_console_exposes_a_control_for_every_settings_route() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "main", &mock, "k1")
+        .await;
+    s.login("admin", "password123").await;
+
+    let html = s.get("/").await.text().await.unwrap();
+    for route in [
+        "/api/settings/providers",
+        "/api/settings/provider-keys",
+        "/api/settings/clients",
+        "/api/settings/aliases",
+        "/api/settings/users",
+        "/api/settings/limits",
+    ] {
+        assert!(html.contains(route), "no control posts to {route}");
+    }
+    assert!(html.contains(r#"data-tab="settings""#), "no settings tab");
+}

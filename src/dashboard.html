@@ -159,6 +159,30 @@
   .alert-head { padding: 7px 12px 0; color: var(--accent); font-weight: 600; }
   .alert-body { padding: 2px 12px 8px; color: var(--ink-2); font-size: 11px; }
 
+  /* --- settings forms ---------------------------------------------------- */
+  form.row {
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    padding: 8px 12px 2px; border-top: 1px solid var(--line);
+  }
+  form.row input[type=text], form.row input:not([type]), form.row input[type=password],
+  form.row input[type=number] {
+    background: var(--bg); border: 1px solid var(--line-2); color: var(--ink);
+    font-family: var(--mono); font-size: 12px; padding: 4px 7px; border-radius: 0;
+  }
+  form.row input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  form.row label { color: var(--dim); font-size: 11px; display: inline-flex; gap: 5px; align-items: center; }
+  form.row button, .rowbtn {
+    background: var(--panel-2); border: 1px solid var(--line-2); color: var(--ink);
+    font-family: var(--mono); font-size: 11px; padding: 4px 10px; cursor: pointer;
+    border-radius: 0; transition: border-color .12s, color .12s;
+  }
+  form.row button:hover, .rowbtn:hover { color: var(--accent); border-color: var(--accent); }
+  .rowbtn.danger:hover { color: var(--err); border-color: var(--err); }
+  .secret {
+    display: block; margin-top: 6px; padding: 7px 9px; background: var(--bg);
+    border: 1px dashed var(--accent-d); color: var(--accent); word-break: break-all;
+  }
+
   footer {
     margin-top: 20px; color: var(--dim); font-size: 11px;
     letter-spacing: 0; text-transform: none;
@@ -197,6 +221,7 @@
     <button data-tab="clients">Clients</button>
     <button data-tab="capacity">Capacity</button>
     <button data-tab="reliability">Reliability</button>
+    <button data-tab="settings">Settings</button>
   </nav>
 
   <!-- OVERVIEW -->
@@ -283,6 +308,78 @@
         <thead><tr><th data-k="status">Status</th><th class="num" data-k="count">Count</th><th>Class</th></tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+  </div>
+
+
+  <!-- SETTINGS -->
+  <div id="settings" class="tab hidden">
+    <div id="cfg-note" class="panel alert hidden">
+      <div class="alert-head" id="cfg-note-head"></div>
+      <div class="alert-body" id="cfg-note-body"></div>
+    </div>
+
+    <div class="panel card">
+      <h2>Providers</h2>
+      <div id="cfg-providers"></div>
+      <form class="row" data-post="/api/settings/providers" data-action="add">
+        <input name="name" placeholder="name" size="10" required>
+        <input name="base_url" placeholder="https://host  (a trailing /v1 is trimmed)" size="34" required>
+        <input name="key" placeholder="first api key" size="22" required>
+        <input name="rpm" type="number" value="40" min="1" max="10000" size="5" title="requests per minute">
+        <button type="submit">add provider</button>
+      </form>
+    </div>
+
+    <div class="panel card" style="margin-top:8px">
+      <h2>Provider keys</h2>
+      <div id="cfg-keys"></div>
+      <form class="row" data-post="/api/settings/provider-keys" data-action="add">
+        <input name="provider" placeholder="provider" size="10" required>
+        <input name="key" placeholder="api key" size="34" required>
+        <input name="rpm" type="number" value="40" min="1" max="10000" size="5">
+        <button type="submit">add key</button>
+      </form>
+    </div>
+
+    <div class="panel card" style="margin-top:8px">
+      <h2>Client keys — what your harness authenticates with</h2>
+      <div id="cfg-clients"></div>
+      <form class="row" data-post="/api/settings/clients" data-action="mint">
+        <input name="label" placeholder="label, e.g. laptop" size="20" required>
+        <button type="submit">mint key</button>
+      </form>
+    </div>
+
+    <div class="panel card" style="margin-top:8px">
+      <h2>Virtual models — one name, an ordered list of targets</h2>
+      <div id="cfg-aliases"></div>
+      <form class="row" data-post="/api/settings/aliases" data-action="upsert" data-targets="1">
+        <input name="name" placeholder="alias name" size="16" required>
+        <input name="targets" placeholder="provider:model, provider:model  (tried in order)" size="42" required>
+        <button type="submit">save alias</button>
+      </form>
+    </div>
+
+    <div class="panel card" style="margin-top:8px">
+      <h2>Operators</h2>
+      <div id="cfg-users"></div>
+      <form class="row" data-post="/api/settings/users" data-action="add">
+        <input name="username" placeholder="username" size="14" required>
+        <input name="password" type="password" placeholder="password (10+ chars)" size="22" required>
+        <label class="chk"><input name="admin" type="checkbox"> admin</label>
+        <button type="submit">add operator</button>
+      </form>
+    </div>
+
+    <div class="panel card" style="margin-top:8px">
+      <h2>Limits</h2>
+      <form class="row" data-post="/api/settings/limits" data-plain="1">
+        <label>max in-flight <input name="max_inflight" type="number" min="1" size="6" id="lim-inflight"></label>
+        <label>catalog ttl (s) <input name="models_ttl_secs" type="number" min="0" size="6" id="lim-ttl"></label>
+        <label>history (days) <input name="history_days" type="number" min="0" size="5" id="lim-hist"></label>
+        <button type="submit">save limits</button>
+      </form>
     </div>
   </div>
 
@@ -466,8 +563,169 @@
       : `<div class="empty">No model is being held back</div>`;
   }
 
+
+  // --- settings ------------------------------------------------------------
+
+  let cfg2 = null;   // /api/settings
+
+  function note(kind, head, body) {
+    const el = $("cfg-note");
+    el.classList.remove("hidden");
+    el.style.borderColor = kind === "err" ? "var(--err)" : "var(--accent-d)";
+    $("cfg-note-head").textContent = (kind === "err" ? "[ !! ] " : "[ ok ] ") + head;
+    $("cfg-note-head").style.color = kind === "err" ? "var(--err)" : "var(--accent)";
+    $("cfg-note-body").innerHTML = body || "";
+  }
+
+  async function settingsPost(path, payload) {
+    const r = await fetch(path, {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    let d = null;
+    try { d = await r.json(); } catch (_) { /* empty body */ }
+    if (!r.ok) {
+      note("err", d?.error?.message || `request failed (${r.status})`, "");
+      return null;
+    }
+    return d ?? {};
+  }
+
+  async function loadSettings() {
+    const r = await fetch("/api/settings", { credentials: "same-origin" });
+    if (!r.ok) return;
+    cfg2 = await r.json();
+    renderSettings();
+  }
+
+  function actionBtn(label, danger, fn) {
+    const b = document.createElement("button");
+    b.className = "rowbtn" + (danger ? " danger" : "");
+    b.textContent = label;
+    b.onclick = fn;
+    return b;
+  }
+
+  function table(rows, cols) {
+    const t = document.createElement("table");
+    const head = document.createElement("thead");
+    head.innerHTML = "<tr>" + cols.map((c) => `<th>${esc(c)}</th>`).join("") + "</tr>";
+    t.appendChild(head);
+    const body = document.createElement("tbody");
+    for (const cells of rows) {
+      const tr = document.createElement("tr");
+      for (const cell of cells) {
+        const td = document.createElement("td");
+        if (cell instanceof Node) td.appendChild(cell);
+        else td.textContent = cell;
+        tr.appendChild(td);
+      }
+      body.appendChild(tr);
+    }
+    t.appendChild(body);
+    return t;
+  }
+
+  function fill(id, node, emptyMsg) {
+    const host = $(id);
+    host.innerHTML = "";
+    if (!node) { host.innerHTML = `<div class="empty">${esc(emptyMsg)}</div>`; return; }
+    host.appendChild(node);
+  }
+
+  async function act(path, payload, okMsg) {
+    const d = await settingsPost(path, payload);
+    if (!d) return;
+    // A minted secret is returned exactly once; show it until the operator
+    // navigates away rather than burying it in a toast that vanishes.
+    if (d.key) note("ok", "client key minted — copy it now, it is not stored",
+                    `<span class="secret">${esc(d.key)}</span>`);
+    else note("ok", okMsg, "");
+    await loadSettings();
+    await refresh();
+  }
+
+  function renderSettings() {
+    if (!cfg2) return;
+
+    const provs = cfg2.providers || [];
+    fill("cfg-providers", provs.length ? table(provs.map((p) => [
+      p.name, p.base_url, `${p.keys.length} key${p.keys.length === 1 ? "" : "s"}`,
+      actionBtn("remove", true, () => act("/api/settings/providers",
+        { action: "remove", name: p.name }, `provider ${p.name} removed`)),
+    ]), ["provider", "base url", "keys", ""]) : null, "no providers configured");
+
+    const keyRows = [];
+    for (const p of provs) {
+      p.keys.forEach((k, i) => keyRows.push([
+        p.name, "…" + k.last4, String(k.rpm), k.enabled ? "enabled" : "disabled",
+        actionBtn(k.enabled ? "disable" : "enable", k.enabled, () =>
+          act("/api/settings/provider-keys",
+              { action: "update", provider: p.name, index: i, enabled: !k.enabled },
+              `key …${k.last4} ${k.enabled ? "disabled" : "enabled"}`)),
+        actionBtn("remove", true, () =>
+          act("/api/settings/provider-keys", { action: "remove", provider: p.name, index: i },
+              `key …${k.last4} removed`)),
+      ]));
+    }
+    fill("cfg-keys", keyRows.length ? table(keyRows,
+      ["provider", "key", "rpm", "state", "", ""]) : null, "no provider keys");
+
+    const cls = cfg2.clients || [];
+    fill("cfg-clients", cls.length ? table(cls.map((c) => [
+      c.label, "…" + c.last4, c.owner || "—",
+      actionBtn("revoke", true, () => act("/api/settings/clients",
+        { action: "revoke", last4: c.last4 }, `client key …${c.last4} revoked`)),
+    ]), ["label", "key", "owner", ""]) : null, "no client keys — your harness needs one");
+
+    const als = cfg2.aliases || [];
+    fill("cfg-aliases", als.length ? table(als.map((a) => [
+      a.name, a.targets.map((t) => `${t.provider}:${t.model}`).join("  →  "),
+      actionBtn("remove", true, () => act("/api/settings/aliases",
+        { action: "remove", name: a.name }, `alias ${a.name} removed`)),
+    ]), ["name", "targets, tried in order", ""]) : null, "no virtual models defined");
+
+    const us = cfg2.users || [];
+    fill("cfg-users", us.length ? table(us.map((u) => [
+      u.username, u.role,
+      u.role === "superuser" ? "" : actionBtn("remove", true, () =>
+        act("/api/settings/users", { action: "remove", username: u.username },
+            `operator ${u.username} removed`)),
+    ]), ["username", "role", ""]) : null, "only you (a plain user sees no list)");
+
+    const st = cfg2.settings || {};
+    if ($("lim-inflight").value === "") $("lim-inflight").value = st.max_inflight ?? "";
+    if ($("lim-ttl").value === "") $("lim-ttl").value = st.models_ttl_secs ?? "";
+    if ($("lim-hist").value === "") $("lim-hist").value = st.history_days ?? "";
+  }
+
+  // One submit handler for every settings form: the shape is declared on the
+  // element, so adding a form needs no new JavaScript.
+  document.querySelectorAll("form.row").forEach((f) => {
+    f.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(f).entries());
+      const payload = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (v === "") continue;
+        payload[k] = /^[0-9]+$/.test(v) && k !== "key" && k !== "label" ? Number(v) : v;
+      }
+      if (f.dataset.action) payload.action = f.dataset.action;
+      if (f.querySelector("[name=admin]")) payload.admin = f.querySelector("[name=admin]").checked;
+      if (f.dataset.targets) {
+        payload.targets = String(data.targets || "").split(",").map((t) => {
+          const [provider, ...rest] = t.trim().split(":");
+          return { provider: provider.trim(), model: rest.join(":").trim() };
+        }).filter((t) => t.provider && t.model);
+      }
+      await act(f.dataset.post, payload, "saved");
+      f.querySelectorAll("input:not([type=number])").forEach((i) => { i.value = ""; });
+    });
+  });
+
   function renderAll() {
-    renderStrip(); renderOverview(); renderModels(); renderClients(); renderCapacity(); renderReliability();
+    renderStrip(); renderOverview(); renderModels(); renderClients(); renderCapacity(); renderReliability(); renderSettings();
   }
 
   // Tabs
@@ -476,6 +734,7 @@
     const b = e.target.closest("button[data-tab]"); if (!b) return;
     tabs.querySelectorAll("button").forEach((x) => x.setAttribute("aria-selected", x === b));
     document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("hidden", t.id !== b.dataset.tab));
+    if (b.dataset.tab === "settings" && !cfg2) loadSettings();
   });
 
   bindSort("tbl-models", () => stats.models || []);
