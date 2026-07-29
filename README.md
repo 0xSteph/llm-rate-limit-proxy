@@ -77,7 +77,7 @@ wizard.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HOST` / `PORT` | `0.0.0.0` / `8000` | Bind address |
+| `HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address. Loopback by default — this process holds every provider key and terminates no TLS, so set `HOST=0.0.0.0` only behind a reverse proxy |
 | `DATA_DIR` | `data` | Where the config store and history live |
 | `TRUST_PROXY` | `false` | Trust `X-Forwarded-Proto`; marks the session cookie `Secure` |
 

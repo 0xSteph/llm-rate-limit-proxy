@@ -1246,3 +1246,54 @@ async fn a_plain_user_cannot_revoke_someone_elses_client_key() {
         "revoking another user's key must be refused"
     );
 }
+
+/// Resetting a password is the standard response to a compromised account. If
+/// existing sessions survive it, the reset achieves nothing against whoever is
+/// already holding a cookie.
+#[tokio::test]
+async fn changing_a_password_invalidates_that_users_existing_sessions() {
+    let mock = support::start_mock_upstream().await;
+    let s = server_with_plain_user(&mock).await;
+
+    // A second client, so the victim's cookie jar is independent of the admin's.
+    let victim = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let login = victim
+        .post(format!("{}/login", s.base_url))
+        .form(&[("username", "plain"), ("password", "correcthorsebattery")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303);
+    let before = victim
+        .get(format!("{}/api/settings", s.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(before.status(), 200, "session works before the reset");
+
+    // An admin resets that account's password.
+    s.login("admin", "password123").await;
+    let r = settings_post(
+        &s,
+        "/api/settings/users",
+        serde_json::json!({"action": "set_password", "username": "plain",
+                           "password": "a-completely-new-one"}),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+
+    let after = victim
+        .get(format!("{}/api/settings", s.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        303,
+        "a reset password must not leave the old session usable"
+    );
+}

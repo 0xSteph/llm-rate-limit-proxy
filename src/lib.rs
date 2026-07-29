@@ -312,7 +312,10 @@ pub async fn run() {
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state);
 
-    let host = env_or("HOST", "0.0.0.0");
+    // Loopback by default. This process holds every provider key in the pool and
+    // terminates no TLS of its own, so exposure has to be a deliberate act rather
+    // than what happens if you read no documentation.
+    let host = env_or("HOST", "127.0.0.1");
     let port: u16 = env_or("PORT", "8000")
         .parse()
         .expect("PORT must be a number");

@@ -136,19 +136,30 @@ impl Admin {
             .as_secs()
     }
 
-    fn sign_token(&self, username: &str, expiry: u64) -> String {
-        let payload = format!("{username}|{expiry}");
+    fn sign_token(&self, username: &str, witness: &str, expiry: u64) -> String {
+        let payload = format!("{username}|{witness}|{expiry}");
         let sig = hmac_sha256(&self.key, payload.as_bytes());
         format!("{}.{}", b64(payload.as_bytes()), b64(&sig))
     }
 
     /// Mint a session token valid for `ttl_secs` seconds.
-    pub fn mint(&self, username: &str, ttl_secs: u64) -> String {
-        self.sign_token(username, Self::now() + ttl_secs)
+    pub fn mint(&self, username: &str, witness: &str, ttl_secs: u64) -> String {
+        self.sign_token(username, witness, Self::now() + ttl_secs)
     }
 
-    /// Return the username iff the token's signature is valid and it hasn't expired.
-    pub fn verify(&self, token: &str) -> Option<String> {
+    /// A short, non-reversible witness of a stored password hash.
+    ///
+    /// Sessions carry this so a password change invalidates them. The hash
+    /// itself never goes in the cookie — only evidence of which hash was current
+    /// when the session began.
+    pub fn pw_witness(pw_hash: &str) -> String {
+        sha256_hex(pw_hash.as_bytes())[..12].to_string()
+    }
+
+    /// Return `(username, password witness)` iff the signature is valid and the
+    /// token has not expired. The caller checks the witness against the account's
+    /// current hash, which is what makes a password reset end live sessions.
+    pub fn verify(&self, token: &str) -> Option<(String, String)> {
         let (payload_b64, sig_b64) = token.split_once('.')?;
         let payload = b64d(payload_b64)?;
         let sig = b64d(sig_b64)?;
@@ -157,11 +168,14 @@ impl Admin {
             return None;
         }
         let payload = String::from_utf8(payload).ok()?;
-        let (username, expiry) = payload.rsplit_once('|')?;
+        // Split from the right: only the last two fields are ours, so a username
+        // containing the separator cannot shift the parse.
+        let (head, expiry) = payload.rsplit_once('|')?;
+        let (username, witness) = head.rsplit_once('|')?;
         if Self::now() >= expiry.parse::<u64>().ok()? {
             return None;
         }
-        Some(username.to_string())
+        Some((username.to_string(), witness.to_string()))
     }
 
     /// True while the failure window is saturated — reject new attempts.
@@ -225,9 +239,20 @@ pub async fn require_session(
         .headers()
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok());
-    let who = session_from_cookies(cookie).and_then(|t| state.admin.verify(&t));
+    let who = session_from_cookies(cookie)
+        .and_then(|t| state.admin.verify(&t))
+        .filter(|(username, witness)| {
+            // The account must still exist and still have the password this
+            // session was issued against. A reset or a deletion ends it here.
+            let store = state.store.lock().unwrap();
+            store
+                .users
+                .iter()
+                .find(|u| &u.username == username)
+                .is_some_and(|u| Admin::pw_witness(&u.pw_hash) == *witness)
+        });
     match who {
-        Some(username) => {
+        Some((username, _)) => {
             // Carry the identity forward. Discarding it here is what let every
             // logged-in account act with full authority: a handler that cannot
             // tell who is calling cannot refuse anybody.
@@ -318,21 +343,23 @@ pub async fn login_submit(
         )
             .into_response();
     }
-    let ok = {
+    // Capture the witness of the hash we authenticated against, so the session
+    // is tied to this exact password and not merely to the username.
+    let (ok, witness) = {
         let store = state.store.lock().unwrap();
-        store
-            .users
-            .iter()
-            .find(|u| u.username == form.username)
-            .map(|u| verify_password(&form.password, &u.pw_hash))
-            .unwrap_or(false)
+        match store.users.iter().find(|u| u.username == form.username) {
+            Some(u) if verify_password(&form.password, &u.pw_hash) => {
+                (true, Admin::pw_witness(&u.pw_hash))
+            }
+            _ => (false, String::new()),
+        }
     };
     if !ok {
         state.admin.record_login_failure();
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
     state.admin.reset_login_failures();
-    let token = state.admin.mint(&form.username, SESSION_TTL);
+    let token = state.admin.mint(&form.username, &witness, SESSION_TTL);
     let cookie = session_cookie(&token, state.admin.secure_cookies());
     (
         StatusCode::SEE_OTHER,
@@ -413,31 +440,52 @@ mod tests {
     #[test]
     fn session_mint_then_verify_roundtrips() {
         let a = Admin::new(false);
-        let t = a.mint("alice", 3600);
-        assert_eq!(a.verify(&t).as_deref(), Some("alice"));
+        let t = a.mint("alice", "w1", 3600);
+        assert_eq!(a.verify(&t).unwrap().0, "alice");
     }
 
     #[test]
     fn session_forged_payload_rejected() {
         let a = Admin::new(false);
-        let real = a.mint("alice", 3600);
+        let real = a.mint("alice", "w1", 3600);
         let (_, sig) = real.split_once('.').unwrap();
         // Keep alice's signature but swap in a forged identity/expiry.
-        let forged = format!("{}.{sig}", b64(b"mallory|9999999999"));
+        let forged = format!("{}.{sig}", b64(b"mallory|w1|9999999999"));
         assert!(a.verify(&forged).is_none());
     }
 
     #[test]
     fn session_expired_token_rejected() {
         let a = Admin::new(false);
-        let expired = a.sign_token("alice", Admin::now().saturating_sub(10));
+        let expired = a.sign_token("alice", "w1", Admin::now().saturating_sub(10));
         assert!(a.verify(&expired).is_none());
+    }
+
+    #[test]
+    fn pw_witness_changes_with_the_hash() {
+        let a = Admin::pw_witness("pbkdf2$sha256$1$aaa$bbb");
+        let b = Admin::pw_witness("pbkdf2$sha256$1$aaa$ccc");
+        assert_ne!(a, b, "a new password must produce a new witness");
+        assert_eq!(a.len(), 12);
+        assert!(
+            !"pbkdf2$sha256$1$aaa$bbb".contains(&a),
+            "the hash itself is not leaked"
+        );
+    }
+
+    #[test]
+    fn session_carries_the_witness_it_was_minted_with() {
+        let a = Admin::new(false);
+        let t = a.mint("alice", "witness-1", 3600);
+        let (user, witness) = a.verify(&t).unwrap();
+        assert_eq!(user, "alice");
+        assert_eq!(witness, "witness-1");
     }
 
     #[test]
     fn session_foreign_key_rejected() {
         let (a, b) = (Admin::new(false), Admin::new(false));
-        let t = a.mint("alice", 3600);
+        let t = a.mint("alice", "w1", 3600);
         assert!(b.verify(&t).is_none());
     }
 
