@@ -288,10 +288,10 @@ fn resolve_plan(
     steps
 }
 
-fn requested_model(body: &Bytes) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+fn requested_model(body: &serde_json::Value) -> Option<String> {
+    body.get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
 }
 
 /// Conversation identity for sticky routing: the model plus the opening messages.
@@ -299,11 +299,10 @@ fn requested_model(body: &Bytes) -> Option<String> {
 /// head, so hashing the head yields the same value each turn while the tail grows
 /// — which is exactly the prefix the upstream would have cached. `None` for
 /// requests with no `messages` array, which carry no conversation to pin.
-fn session_key(body: &Bytes) -> Option<u64> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let messages = v.get("messages")?.as_array()?;
+fn session_key(body: &serde_json::Value) -> Option<u64> {
+    let messages = body.get("messages")?.as_array()?;
     let mut h = DefaultHasher::new();
-    v.get("model")
+    body.get("model")
         .and_then(|m| m.as_str())
         .unwrap_or_default()
         .hash(&mut h);
@@ -320,8 +319,8 @@ fn session_key(body: &Bytes) -> Option<u64> {
 /// to be guessed from frame counts. Returns `None` when there is nothing to do:
 /// a body that isn't a JSON object, or one where the client already set
 /// `stream_options` — their choice wins over our accounting.
-fn inject_usage(body: &Bytes) -> Option<Bytes> {
-    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+fn inject_usage(body: &serde_json::Value) -> Option<Bytes> {
+    let mut v = body.clone();
     let obj = v.as_object_mut()?;
     if obj.contains_key("stream_options") {
         return None;
@@ -515,25 +514,35 @@ pub async fn handle(
     // would spend rate budget on a poll, return whichever provider won the lane,
     // and hide every alias — which are routable names a harness can only learn
     // about from here.
-    if method == Method::GET && uri.path() == "/v1/models" {
+    // Matched on the normalized path, not the raw one: a harness sending the
+    // doubled prefix asks for its catalog down the same wrong path as everything
+    // else, and routing decisions must see what forwarding will see.
+    let route = path_query.split('?').next().unwrap_or_default();
+    if method == Method::GET && route == "/v1/models" {
         return serve_catalog(&state, &aliases, deadline).await;
     }
 
-    let requested = requested_model(&body);
+    // Parsed exactly once. Four helpers need to look inside the body and an
+    // agent transcript is the largest thing this process handles, so parsing it
+    // per-helper was the most expensive avoidable work on the hot path. A body
+    // that isn't JSON simply answers `None` to all of them and is forwarded
+    // untouched, which is what a passthrough proxy should do anyway.
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+    let requested = parsed.as_ref().and_then(requested_model);
     let model_label = requested.clone().unwrap_or_else(|| "unknown".to_string());
-    let session = session_key(&body);
+    let session = parsed.as_ref().and_then(session_key);
 
     // Streaming: commit 200 text/event-stream now and drive the request in a worker
     // that heartbeats while it paces/retries, then relays the upstream SSE body.
-    if wants_stream(&body) {
+    if parsed.as_ref().is_some_and(wants_stream) {
         // Ask for exact token counts unless this model has already told us it
         // rejects the field; keep the original so that can be undone per request.
-        let (out_body, fallback) = match state.no_inject.lock().unwrap().contains(&model_label) {
-            true => (body.clone(), None),
-            false => match inject_usage(&body) {
-                Some(injected) => (injected, Some(body.clone())),
-                None => (body.clone(), None),
-            },
+        let injected = (!state.no_inject.lock().unwrap().contains(&model_label))
+            .then(|| parsed.as_ref().and_then(inject_usage))
+            .flatten();
+        let (out_body, fallback) = match injected {
+            Some(with_usage) => (with_usage, Some(body.clone())),
+            None => (body.clone(), None),
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
         tokio::spawn(stream_proxy(
@@ -546,7 +555,7 @@ pub async fn handle(
             deadline,
             aliases,
             client,
-            model_label,
+            requested,
             session,
             inflight,
             tx,
@@ -703,10 +712,9 @@ async fn relay(state: &Arc<AppState>, model: &str, upstream: reqwest::Response) 
 // --- Streaming path ----------------------------------------------------------
 
 /// True if the client asked for a streamed response (`"stream": true`).
-fn wants_stream(body: &Bytes) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
+fn wants_stream(body: &serde_json::Value) -> bool {
+    body.get("stream")
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
 }
 
@@ -771,7 +779,7 @@ async fn stream_proxy(
     deadline: Option<Instant>,
     aliases: Vec<Alias>,
     client: String,
-    model: String,
+    requested: Option<String>,
     session: Option<u64>,
     // Held for the life of the stream so `max_inflight` bounds live streams too,
     // not just the brief window before the response is committed.
@@ -779,18 +787,14 @@ async fn stream_proxy(
     tx: Tx,
 ) {
     let t0 = Instant::now();
+    let model = requested.clone().unwrap_or_else(|| "unknown".to_string());
     // Immediate heartbeat so the client sees the stream is live right away.
     if tx.send(heartbeat_frame()).await.is_err() {
         return;
     }
     let pool_len = state.pool.read().unwrap().len();
     let offering = state.catalog.providers_offering(&model);
-    let plan = resolve_plan(
-        requested_model(&body).as_deref(),
-        &aliases,
-        pool_len,
-        &offering,
-    );
+    let plan = resolve_plan(requested.as_deref(), &aliases, pool_len, &offering);
     let last = plan.len().saturating_sub(1);
     let mut excluded: Vec<usize> = Vec::new();
     let mut retried_plain = false;
@@ -1045,9 +1049,13 @@ mod tests {
         assert_eq!(providers_of(&plan), vec![Some("chosen")]);
     }
 
+    fn json(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).expect("test fixture is valid json")
+    }
+
     #[test]
     fn usage_injection_adds_include_usage() {
-        let out = inject_usage(&Bytes::from(r#"{"model":"m","stream":true}"#)).unwrap();
+        let out = inject_usage(&json(r#"{"model":"m","stream":true}"#)).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["stream_options"]["include_usage"], true);
         assert_eq!(v["model"], "m", "the rest of the body is untouched");
@@ -1057,14 +1065,25 @@ mod tests {
     /// is not a good enough reason to overwrite what they asked for.
     #[test]
     fn usage_injection_leaves_a_clients_own_stream_options_alone() {
-        let body = Bytes::from(r#"{"model":"m","stream_options":{"include_usage":false}}"#);
+        let body = json(r#"{"model":"m","stream_options":{"include_usage":false}}"#);
         assert!(inject_usage(&body).is_none());
     }
 
     #[test]
-    fn usage_injection_declines_bodies_it_cannot_parse() {
-        assert!(inject_usage(&Bytes::from("not json")).is_none());
-        assert!(inject_usage(&Bytes::from("[1,2,3]")).is_none());
+    fn usage_injection_declines_a_body_that_is_not_an_object() {
+        assert!(inject_usage(&json("[1,2,3]")).is_none());
+        assert!(inject_usage(&serde_json::Value::Null).is_none());
+    }
+
+    /// The parse happens once, at the edge. A body that isn't JSON yields no
+    /// model, no session and no stream flag, and is forwarded untouched.
+    #[test]
+    fn a_non_json_body_is_simply_opaque() {
+        let parsed: Option<serde_json::Value> = serde_json::from_slice(b"not json").ok();
+        assert!(parsed.is_none());
+        assert!(parsed.as_ref().and_then(requested_model).is_none());
+        assert!(parsed.as_ref().and_then(session_key).is_none());
+        assert!(!parsed.as_ref().is_some_and(wants_stream));
     }
 
     #[test]

@@ -362,9 +362,11 @@ pub async fn aliases(
     finish(&state)
 }
 
-/// Persist and rebuild, mapping the outcome to a response.
-fn finish(state: &Arc<AppState>) -> Response {
-    match apply(state) {
+/// Turn a persistence outcome into a response. A failed save is the one error
+/// here the operator cannot act on, so it is reported verbatim rather than
+/// flattened into something reassuring.
+fn saved(result: Result<(), String>) -> Response {
+    match result {
         Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -372,6 +374,11 @@ fn finish(state: &Arc<AppState>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Persist and rebuild the pool, mapping the outcome to a response.
+fn finish(state: &Arc<AppState>) -> Response {
+    saved(apply(state))
 }
 
 #[derive(Deserialize)]
@@ -422,11 +429,7 @@ pub async fn clients(
     drop(store);
 
     if let Err(e) = config::save(&state.data_dir, &snapshot) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": {"message": e, "code": "save_failed"}})),
-        )
-            .into_response();
+        return saved(Err(e));
     }
     match minted {
         Some(secret) => (
@@ -519,14 +522,7 @@ pub async fn users(State(state): State<Arc<AppState>>, Json(action): Json<UserAc
         }
         store.clone()
     };
-    match config::save(&state.data_dir, &snapshot) {
-        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": {"message": e, "code": "save_failed"}})),
-        )
-            .into_response(),
-    }
+    saved(config::save(&state.data_dir, &snapshot))
 }
 
 #[derive(Deserialize)]
@@ -555,14 +551,7 @@ pub async fn limits(State(state): State<Arc<AppState>>, Json(req): Json<LimitsRe
         }
         store.clone()
     };
-    match config::save(&state.data_dir, &snapshot) {
-        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": {"message": e, "code": "save_failed"}})),
-        )
-            .into_response(),
-    }
+    saved(config::save(&state.data_dir, &snapshot))
 }
 
 #[cfg(test)]

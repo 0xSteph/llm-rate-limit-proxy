@@ -1321,3 +1321,47 @@ async fn the_console_exposes_a_control_for_every_settings_route() {
     }
     assert!(html.contains(r#"data-tab="settings""#), "no settings tab");
 }
+
+/// The doubled-prefix tolerance has to apply to every route, not just the ones
+/// that get forwarded. A harness misconfigured this way asks for its catalog
+/// down the same wrong path as everything else.
+#[tokio::test]
+async fn a_doubled_prefix_still_reaches_the_local_catalog() {
+    let (mock, upstream_hits) = support::start_catalog_mock("real-model").await;
+    let s = Server::start().await;
+    let key = s
+        .complete_wizard_get_key("admin", "password123", "mock", &mock, "k1")
+        .await;
+
+    // Warm the catalog through the correct path (one upstream fetch).
+    let ok = s
+        .client
+        .get(format!("{}/v1/models", s.base_url))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+
+    // Now the misconfigured path. It must be answered locally, from cache.
+    let doubled = s
+        .client
+        .get(format!("{}/v1/v1/models", s.base_url))
+        .header("authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(doubled.status(), 200);
+    let ids: Vec<String> = doubled.json::<serde_json::Value>().await.unwrap()["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&"real-model".to_string()), "got {ids:?}");
+    assert_eq!(
+        upstream_hits.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the doubled path was forwarded upstream instead of served from cache"
+    );
+}
