@@ -552,6 +552,64 @@ mod tests {
         assert!(b.verify(&t).is_none());
     }
 
+    // --- properties over untrusted input ---------------------------------
+    //
+    // A cookie header and a session token are supplied by whoever is calling,
+    // before any authentication has happened. These run on every request from
+    // an anonymous caller, so a panic here is an unauthenticated denial of
+    // service and a false accept is a total authentication bypass.
+
+    proptest::proptest! {
+        #[test]
+        fn cookie_parsing_never_panics(raw in ".*") {
+            let _ = session_from_cookies(Some(&raw));
+        }
+
+        #[test]
+        fn arbitrary_tokens_never_verify(raw in ".*") {
+            let a = Admin::new(false);
+            // Nothing a caller can invent should verify under a key they do not
+            // have. The only accepted tokens are ones this Admin signed.
+            proptest::prop_assert!(a.verify(&raw).is_none());
+        }
+
+        /// Signature checking must not be fooled by the payload's own shape —
+        /// usernames may contain the field separator, and the parse splits from
+        /// the right so those extra separators cannot shift the boundaries.
+        #[test]
+        fn a_signed_token_round_trips_whatever_the_username(
+            user in "[^\\.]{1,40}", witness in "[a-f0-9]{0,16}"
+        ) {
+            let a = Admin::new(false);
+            let t = a.mint(&user, &witness, 3600);
+            let got = a.verify(&t);
+            proptest::prop_assert_eq!(got, Some((user, witness)));
+        }
+
+        /// A corrupt or hostile config store must fail closed, never panic and
+        /// never accept.
+        #[test]
+        fn password_verification_survives_a_mangled_hash(pw in ".*", stored in ".*") {
+            proptest::prop_assert!(!verify_password(&pw, &stored));
+        }
+
+    }
+
+    // Hashing is deliberately expensive — 600k PBKDF2 rounds — so this one runs
+    // a handful of cases rather than proptest's default 256. At the default it
+    // took five minutes on its own, and a test suite nobody wants to run is a
+    // test suite that stops being run.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(8))]
+        #[test]
+        fn a_real_password_still_verifies(pw in ".{1,64}") {
+            let stored = hash_password(&pw);
+            proptest::prop_assert!(verify_password(&pw, &stored));
+            let wrong = format!("{pw}x");
+            proptest::prop_assert!(!verify_password(&wrong, &stored));
+        }
+    }
+
     #[test]
     fn cookie_parse_finds_session() {
         assert_eq!(

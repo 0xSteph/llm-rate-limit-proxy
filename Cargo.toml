@@ -29,6 +29,9 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
 serde_json = "1"
 tempfile = "3"
+# Property tests over the parsers that eat untrusted bytes. Dev-only: it never
+# reaches the shipped binary.
+proptest = "1"
 
 # PBKDF2 runs 600k HMAC-SHA256 iterations; at opt-level 0 every debug-build login
 # (and the auth tests) would take seconds. Bump only the hashing chain.

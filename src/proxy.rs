@@ -945,6 +945,7 @@ async fn stream_body(resp: reqwest::Response, deadline: Option<Instant>, tx: &Tx
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::any;
 
     fn with_retry_after(v: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -1084,6 +1085,80 @@ mod tests {
         assert!(parsed.as_ref().and_then(requested_model).is_none());
         assert!(parsed.as_ref().and_then(session_key).is_none());
         assert!(!parsed.as_ref().is_some_and(wants_stream));
+    }
+
+    // --- properties over untrusted input ---------------------------------
+    //
+    // These parsers read bytes chosen by someone else — a client's path and
+    // body, an upstream's headers. The property that matters most is the dull
+    // one: whatever arrives, they return a value and never panic. A panic in an
+    // axum handler kills that request, and a panic reachable by any caller is a
+    // denial of service with no authentication needed.
+
+    proptest::proptest! {
+        #[test]
+        fn normalize_path_never_panics_and_stays_a_path(raw in ".*") {
+            let out = normalize_path(&raw);
+            // Collapsing only ever removes whole "/v1" segments, so the result
+            // cannot grow and cannot invent a prefix the caller never sent.
+            proptest::prop_assert!(out.len() <= raw.len());
+            if raw.starts_with('/') {
+                proptest::prop_assert!(out.starts_with('/'));
+            }
+            // Idempotent: normalizing an already-normal path changes nothing.
+            proptest::prop_assert_eq!(normalize_path(&out), out.clone());
+        }
+
+        #[test]
+        fn normalize_path_leaves_no_doubled_prefix(depth in 0usize..12, tail in "[a-z/]{0,20}") {
+            let raw = format!("{}{tail}", "/v1".repeat(depth));
+            let out = normalize_path(&raw);
+            proptest::prop_assert!(!out.starts_with("/v1/v1/"), "left a doubled prefix: {}", out);
+        }
+
+        #[test]
+        fn retry_after_never_panics_and_is_always_clamped(raw in ".*") {
+            let mut h = HeaderMap::new();
+            if let Ok(v) = HeaderValue::from_str(&raw) {
+                h.insert(header::RETRY_AFTER, v);
+            }
+            if let Some(d) = retry_after(&h) {
+                proptest::prop_assert!(d <= MAX_RETRY_AFTER, "unclamped: {:?}", d);
+            }
+        }
+
+        /// A body is attacker-controlled and arbitrary bytes are not JSON. Every
+        /// helper has to shrug rather than fall over.
+        #[test]
+        fn body_helpers_survive_arbitrary_bytes(raw in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let parsed: Option<serde_json::Value> = serde_json::from_slice(&raw).ok();
+            let _ = parsed.as_ref().and_then(requested_model);
+            let _ = parsed.as_ref().and_then(session_key);
+            let _ = parsed.as_ref().is_some_and(wants_stream);
+            let _ = parsed.as_ref().and_then(inject_usage);
+            let _ = rewrite_model(&Bytes::from(raw), Some("m"));
+        }
+
+        /// The same conversation must key identically however the tail grows —
+        /// the property the whole affinity design rests on.
+        #[test]
+        fn session_key_ignores_everything_after_the_opening(
+            head in "[a-z ]{1,40}", tail in proptest::collection::vec("[a-z ]{0,20}", 0..8)
+        ) {
+            let opening = serde_json::json!([
+                {"role": "system", "content": head.clone()},
+                {"role": "user", "content": "hello"}
+            ]);
+            let mut grown = opening.as_array().unwrap().clone();
+            for (i, t) in tail.iter().enumerate() {
+                grown.push(serde_json::json!({
+                    "role": if i % 2 == 0 { "assistant" } else { "user" }, "content": t
+                }));
+            }
+            let first = session_key(&serde_json::json!({"model": "m", "messages": opening}));
+            let later = session_key(&serde_json::json!({"model": "m", "messages": grown}));
+            proptest::prop_assert_eq!(first, later);
+        }
     }
 
     #[test]

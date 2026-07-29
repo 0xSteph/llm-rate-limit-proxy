@@ -147,6 +147,9 @@ password, and previously minted client keys still working.
 - Client key secrets are stored only as SHA-256 digests and shown exactly once.
 - CI runs fmt, clippy (`-D warnings`), tests, a release build, the load test,
   and a dependency audit on every push, plus the audit weekly.
+- The parsers that read untrusted bytes — request paths and bodies, upstream
+  headers, session cookies, the config store — carry property tests asserting
+  they never panic and never falsely accept, on generated hostile input.
 
 TLS is not built in — terminate it at a reverse proxy and set `TRUST_PROXY=true`
 so the session cookie is marked `Secure`.

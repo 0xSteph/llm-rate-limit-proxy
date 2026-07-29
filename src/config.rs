@@ -281,6 +281,36 @@ mod tests {
 mod base_url_tests {
     use super::*;
 
+    // A base URL is typed by a person and a config store can be hand-edited or
+    // corrupted, so both are untrusted input to code that runs at boot.
+    proptest::proptest! {
+        #[test]
+        fn normalizing_never_panics_and_is_idempotent(raw in ".*") {
+            let once = normalize_base_url(&raw);
+            proptest::prop_assert_eq!(normalize_base_url(&once), once.clone());
+            proptest::prop_assert!(!once.ends_with('/'), "left a trailing slash: {}", once);
+            proptest::prop_assert!(!once.ends_with("/v1"), "left a /v1 suffix: {}", once);
+        }
+
+        /// However many the caller typed, the result carries none.
+        #[test]
+        fn any_number_of_v1_suffixes_leaves_at_most_one_removed(
+            host in "https?://[a-z]{1,12}", slashes in 0usize..4
+        ) {
+            let raw = format!("{host}/v1{}", "/".repeat(slashes));
+            proptest::prop_assert_eq!(normalize_base_url(&raw), host);
+        }
+
+        #[test]
+        fn a_corrupt_store_is_refused_rather_than_trusted(raw in ".*") {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(store_path(dir.path()), raw.as_bytes()).unwrap();
+            // Either it parses as a real store or it is an error. What it must
+            // never do is panic at boot or silently reset somebody's config.
+            let _ = load(dir.path());
+        }
+    }
+
     /// Requests are forwarded with their full path (`/v1/chat/completions`), so a
     /// base that already ends in `/v1` produces `/v1/v1/chat/completions`. Every
     /// OpenAI-compatible client trains its users to write the base *with* `/v1`,
