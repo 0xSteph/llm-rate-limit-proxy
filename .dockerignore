@@ -1,0 +1,7 @@
+/target
+/data
+.env
+.git
+.github
+tests
+README.md

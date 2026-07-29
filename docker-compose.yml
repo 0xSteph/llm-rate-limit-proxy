@@ -1,0 +1,24 @@
+services:
+  sluice:
+    build: .
+    image: sluice:local
+    # Published to loopback only. Inside its own namespace the container binds
+    # 0.0.0.0 because it must, but what reaches the network is decided here —
+    # change this line and nothing else to expose it, deliberately, behind TLS.
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - sluice-data:/data
+    environment:
+      # Set to true when a TLS-terminating reverse proxy sits in front, so the
+      # session cookie is marked Secure.
+      TRUST_PROXY: "false"
+    restart: unless-stopped
+    # The image has no shell and no package manager; these close the rest.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  sluice-data:

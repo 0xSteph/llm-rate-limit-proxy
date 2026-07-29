@@ -65,6 +65,8 @@ already have.
 ## Running it
 
 ```sh
+docker compose up -d          # published to 127.0.0.1:8000 only
+# or
 cargo run --release
 ```
 
@@ -91,9 +93,26 @@ cargo test --test load -- --ignored   # 100 concurrent clients, asserts zero
                                       # upstream rate violations
 ```
 
+## Security posture
+
+- Binds loopback by default. This process holds every provider key and
+  terminates no TLS, so exposing it is a deliberate `HOST=` behind a reverse
+  proxy.
+- The container is a 6 MB `scratch` image — no shell, no package manager, no
+  libc — running as an unprivileged uid with a read-only root filesystem and
+  all capabilities dropped.
+- Reconfiguring the server is administrator-only. Client keys are self-service
+  but owner-scoped: you can retire your own, not someone else's.
+- Sessions are bound to the password they were issued against, so a reset ends
+  every live session for that account immediately.
+- Client key secrets are stored only as SHA-256 digests and shown exactly once.
+- CI runs fmt, clippy (`-D warnings`), tests, a release build, the load test,
+  and a dependency audit on every push, plus the audit weekly.
+
+TLS is not built in — terminate it at a reverse proxy and set `TRUST_PROXY=true`
+so the session cookie is marked `Secure`.
+
 ## Status
 
-Working and tested, not yet packaged. No Docker image and no TLS termination —
-put a reverse proxy in front for anything exposed. The settings API is complete;
-the dashboard renders observability but not yet forms for every settings route,
-so some changes are a `POST` rather than a click.
+Working, tested, and packaged. The settings API is complete; the console
+renders observability and settings forms, though not every route has a form yet.

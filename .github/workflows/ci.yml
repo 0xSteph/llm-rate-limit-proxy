@@ -1,0 +1,59 @@
+name: CI
+
+# Every gate that used to be "remember to run it" is now a required step. A red
+# commit reached master once because a shell chain didn't check a test result;
+# this is what stops that being possible.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  # Advisories land against dependencies that never change, so a weekly run
+  # catches what a push-triggered build never would.
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings everywhere, not only where a flag was remembered.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: fmt · clippy · test · build
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to commit SHAs, not tags: a tag can be repointed by
+      # whoever owns the repo, and CI runs with access to this checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit and end-to-end tests
+        run: cargo test --locked
+
+      # Builds without dev-dependencies, so a feature only the test profile
+      # enables cannot mask a broken release build — which it did once.
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Load test
+        run: cargo test --release --locked --test load -- --ignored
+
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit --deny warnings
