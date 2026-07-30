@@ -64,7 +64,27 @@ already have.
 
 ## Install
 
-**Container** — the intended path:
+**One line.** Downloads the right binary, verifies its checksum, installs a
+hardened systemd service, and starts it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0xSteph/sluice/master/install.sh | sh
+```
+
+Then open `http://localhost:8000` and finish the wizard. Re-run the same command
+to upgrade; your keys and settings are untouched.
+
+While the repository is private, pass a token that can read it:
+
+```sh
+SLUICE_TOKEN=ghp_... curl -fsSL https://raw.githubusercontent.com/0xSteph/sluice/master/install.sh | sh
+```
+
+It binds loopback, runs as an unprivileged `sluice` user with no shell, stores
+data in `/var/lib/sluice` at mode 0700, and the unit drops every capability.
+Override with `SLUICE_PORT`, `SLUICE_HOST`, `SLUICE_DATA_DIR`.
+
+**Container** — if you would rather not install anything:
 
 ```sh
 docker run -d --name sluice \
