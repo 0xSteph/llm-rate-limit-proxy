@@ -181,19 +181,40 @@ UNIT
     i=$((i + 1)); sleep 0.5
   done
   [ $i -lt 20 ] || die "installed, but it did not come up. Check: journalctl -u sluice -n 50"
+  MANAGED=1
 else
-  say "no systemd here — run it yourself:"
-  say "  DATA_DIR=$DATA_DIR HOST=$HOST PORT=$PORT $BIN_DIR/sluice"
+  MANAGED=0
 fi
 
-cat <<DONE
+# Tell the truth about the machine we are actually on: printing systemctl hints
+# to a box with no systemd, or "open this URL" for something not yet running,
+# is how an installer teaches people not to read its output.
+if [ "$MANAGED" = "1" ]; then
+  cat <<DONE
 
   Done. Open http://localhost:$PORT and finish the setup wizard —
-  the first visitor becomes the admin, so do it now.
+  the first visitor becomes the admin, so do that now.
 
     status    systemctl status sluice
     logs      journalctl -u sluice -f
     upgrade   re-run this installer
-    remove    sudo systemctl disable --now sluice && sudo rm $BIN_DIR/sluice
+    remove    sudo systemctl disable --now sluice \
+                && sudo rm $BIN_DIR/sluice /etc/systemd/system/sluice.service
 
 DONE
+else
+  cat <<DONE
+
+  Installed, but this system has no systemd, so nothing is running yet.
+  Start it with:
+
+    sudo -u $SERVICE_USER DATA_DIR=$DATA_DIR HOST=$HOST PORT=$PORT $BIN_DIR/sluice
+
+  Then open http://localhost:$PORT and finish the setup wizard —
+  the first visitor becomes the admin.
+
+    upgrade   re-run this installer
+    remove    sudo rm $BIN_DIR/sluice
+
+DONE
+fi
