@@ -112,6 +112,24 @@ tar xzf sluice-*-linux-amd64.tar.gz && ./sluice-amd64
 The binary is extracted from the published image rather than built separately,
 so it is the same bytes that run in the container.
 
+**Windows** — a `.exe` is attached to each release. There is no container path
+worth taking on Windows: the image is Linux-only and Docker Desktop is a heavier
+dependency than the binary it would run.
+
+```powershell
+# unzip sluice-VERSION-windows-amd64.zip, then:
+$env:DATA_DIR="$env:LOCALAPPDATA\sluice"; $env:HOST="127.0.0.1"; .\sluice.exe
+```
+
+One caveat worth knowing: the config store is written mode 0600 on Unix, and
+Windows has no equivalent call in this code — the file inherits its directory's
+ACL instead. Keep `DATA_DIR` inside your user profile (the default above does),
+not somewhere with broader permissions, because that file holds every provider
+key you have given it.
+
+To keep it running after you close the terminal, register it with Task Scheduler
+"at log on", or run it under WSL2 where the Linux service applies.
+
 **From source:**
 
 ```sh

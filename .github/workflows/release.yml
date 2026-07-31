@@ -68,15 +68,51 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # Windows cannot come out of the Linux image, so it is built natively on a
+  # Windows runner. There is no container story on Windows worth having: the
+  # scratch image is Linux-only and Docker Desktop is a heavier dependency than
+  # the binary it would be running.
+  windows:
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Test on Windows
+        # The platform-specific paths are all behind cfg(unix), so the suite has
+        # to pass here too or the build is a guess.
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}" -replace '^v',''
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/sluice.exe dist/sluice.exe
+          Compress-Archive -Path dist/sluice.exe -DestinationPath "dist/sluice-$v-windows-amd64.zip"
+          Remove-Item dist/sluice.exe
+          (Get-FileHash "dist/sluice-$v-windows-amd64.zip" -Algorithm SHA256).Hash.ToLower() +
+            "  sluice-$v-windows-amd64.zip" | Out-File -Encoding ascii dist/SHA256SUMS.windows
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows
+          path: dist/*
+
   # Binaries for people who would rather not run Docker. Extracted from the
   # images just built, so the binary someone downloads is bit-identical to the
   # one in the container rather than a separately-built lookalike.
   binaries:
-    needs: image
+    needs: [image, windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows
+          path: dist
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -97,7 +133,9 @@ jobs:
             tar -czf "dist/sluice-${version}-linux-${arch}.tar.gz" -C dist "sluice-${arch}"
             rm "dist/sluice-${arch}"
           done
-          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          # The Windows job computed its own hash on its own runner; fold it in
+          # rather than recomputing, so one file covers every artifact.
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS.windows >> SHA256SUMS && rm SHA256SUMS.windows)
           ls -la dist
 
       - name: Publish the release
