@@ -700,15 +700,11 @@ pub async fn handle(
                 state
                     .metrics
                     .record_ttft(&model_label, upstream_at.elapsed().as_millis() as u64);
-                let gen_start = Instant::now();
-                let out = relay(
-                    &state,
-                    &model_label,
-                    gen_start.elapsed().as_millis() as u64,
-                    resp,
-                )
-                .await;
-                return out;
+                // The body is read inside relay, so the clock has to be handed
+                // in and stopped there. Calling elapsed() here measured the gap
+                // between two adjacent statements — always zero, which is
+                // exactly what the tokens/sec column showed.
+                return relay(&state, &model_label, Instant::now(), resp).await;
             }
             Err(e) => {
                 if !is_last {
@@ -745,7 +741,7 @@ pub async fn handle(
 async fn relay(
     state: &Arc<AppState>,
     model: &str,
-    gen_ms: u64,
+    gen_start: Instant,
     upstream: reqwest::Response,
 ) -> Response {
     let status =
@@ -757,6 +753,7 @@ async fn relay(
         }
     }
     let payload = upstream.bytes().await.unwrap_or_default();
+    let gen_ms = gen_start.elapsed().as_millis() as u64;
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
         harvest(state, model, gen_ms, &v);
     }
