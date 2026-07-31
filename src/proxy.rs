@@ -694,9 +694,13 @@ pub async fn handle(
                     .metrics
                     .record_latency(&model_label, upstream_at.elapsed().as_millis() as u64);
                 state.metrics.record_lane(&permit.provider);
-                // Headers back = first byte from upstream; whatever follows is
-                // generation. On a buffered call these are the two halves of the
-                // wait, and only the first one moves when a provider degrades.
+                // On a buffered call the server generates the whole answer before
+                // it sends anything, so "time to first byte" and "total time" are
+                // the same number and there is no separate generation window.
+                // Recording it as TTFT is still true — it is when the client
+                // could first have seen anything — but the speed calculation has
+                // to span the whole upstream exchange, not the part after
+                // headers, which is why that column read zero.
                 state
                     .metrics
                     .record_ttft(&model_label, upstream_at.elapsed().as_millis() as u64);
@@ -704,7 +708,7 @@ pub async fn handle(
                 // in and stopped there. Calling elapsed() here measured the gap
                 // between two adjacent statements — always zero, which is
                 // exactly what the tokens/sec column showed.
-                return relay(&state, &model_label, Instant::now(), resp).await;
+                return relay(&state, &model_label, upstream_at, resp).await;
             }
             Err(e) => {
                 if !is_last {
@@ -755,7 +759,7 @@ async fn relay(
     let payload = upstream.bytes().await.unwrap_or_default();
     let gen_ms = gen_start.elapsed().as_millis() as u64;
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
-        harvest(state, model, gen_ms, &v);
+        harvest(&state.metrics, model, gen_ms, &v);
     }
     (status, out, payload).into_response()
 }
@@ -766,27 +770,27 @@ async fn relay(
 /// message. `finish_reason` matters more than it looks — `length` means the
 /// answer was cut off at the output cap, which reads as a stupid model until you
 /// can see it was truncated.
-fn harvest(state: &Arc<AppState>, model: &str, gen_ms: u64, v: &serde_json::Value) {
+fn harvest(metrics: &crate::metrics::Metrics, model: &str, gen_ms: u64, v: &serde_json::Value) {
     if let Some(u) = v.get("usage") {
         let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
         let (p, c) = (n("prompt_tokens"), n("completion_tokens"));
         if p > 0 || c > 0 {
-            state.metrics.record_tokens(model, p, c);
+            metrics.record_tokens(model, p, c);
         }
-        state.metrics.record_speed(model, c, gen_ms);
+        metrics.record_speed(model, c, gen_ms);
         let reasoning = u
             .get("completion_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(|x| x.as_u64())
             .unwrap_or(0);
         if reasoning > 0 {
-            state.metrics.record_extras(model, 0, reasoning);
+            metrics.record_extras(model, 0, reasoning);
         }
     }
     if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
         for ch in choices {
             if let Some(r) = ch.get("finish_reason").and_then(|r| r.as_str()) {
-                state.metrics.record_finish(model, r);
+                metrics.record_finish(model, r);
             }
             let calls = ch
                 .get("message")
@@ -795,7 +799,7 @@ fn harvest(state: &Arc<AppState>, model: &str, gen_ms: u64, v: &serde_json::Valu
                 .map(|a| a.len() as u64)
                 .unwrap_or(0);
             if calls > 0 {
-                state.metrics.record_extras(model, calls, 0);
+                metrics.record_extras(model, calls, 0);
             }
         }
     }
@@ -1063,7 +1067,7 @@ async fn stream_body(
                             continue;
                         }
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) {
-                            harvest(state, model, gen_ms, &v);
+                            harvest(&state.metrics, model, gen_ms, &v);
                         }
                     }
                 }
@@ -1139,6 +1143,37 @@ mod tests {
     /// Observed in production: NVIDIA answered 529 "Service temporarily
     /// overloaded" and it reached the client verbatim, because 529 is not in any
     /// RFC and was not in the list. It means retry, so it must be retried.
+    /// Everything an OpenAI-shaped answer reports about itself has to reach the
+    /// metrics. Verified here rather than against a provider, because the
+    /// provider being unavailable is exactly when these numbers matter and
+    /// exactly when a live check cannot run.
+    #[test]
+    fn harvest_reads_usage_finish_reason_and_tool_calls() {
+        let metrics = crate::metrics::Metrics::default();
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "tool_calls": [{"id": "a"}, {"id": "b"}] }
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 250,
+                "completion_tokens_details": { "reasoning_tokens": 40 }
+            }
+        });
+        // 250 completion tokens in 5s = 50/sec.
+        harvest(&metrics, "m", 5000, &body);
+        metrics.record_request("c", "m", "200");
+
+        let stats = metrics.stats();
+        let m = &stats.models[0];
+        assert_eq!(m.completion_tokens, 250, "tokens");
+        assert_eq!(m.avg_tokens_per_sec, 50, "speed");
+        assert_eq!(m.truncated, 1, "finish_reason=length is truncation");
+        assert_eq!(m.tool_calls, 2, "tool calls");
+        assert_eq!(m.reasoning_tokens, 40, "reasoning tokens");
+    }
+
     #[test]
     fn overload_and_timeout_statuses_are_retried() {
         for status in [408, 429, 500, 502, 503, 504, 529] {
