@@ -1430,3 +1430,91 @@ async fn a_session_still_reaches_metrics() {
     s.login("admin", "password123").await;
     assert_eq!(s.get("/metrics").await.status(), 200);
 }
+
+/// Metrics that exist but are never recorded are the same as no metrics. This
+/// drives a real request through and asserts the new measurements actually
+/// arrive at both surfaces — the failure mode being a field that compiles,
+/// exposes, and is forever zero.
+#[tokio::test]
+async fn the_new_measurements_are_actually_recorded() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    let key = s
+        .complete_wizard_get_key("admin", "password123", "mock", &mock, "k1")
+        .await;
+
+    s.client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"m","max_tokens":256,"temperature":0.2,
+                "messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}],
+                "tools":[{"type":"function"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+
+    s.login("admin", "password123").await;
+    let stats: serde_json::Value = s.get("/api/stats").await.json().await.unwrap();
+
+    let shape = &stats["shape"][0];
+    assert_eq!(shape["avg_messages"], 2, "conversation depth: {stats}");
+    assert_eq!(shape["avg_tools"], 1, "tools offered: {stats}");
+    assert_eq!(shape["avg_max_tokens"], 256, "output budget: {stats}");
+    assert_eq!(shape["avg_temperature_x100"], 20, "sampling: {stats}");
+    assert_eq!(stats["buffered"], 1, "stream mix: {stats}");
+    assert!(
+        stats["queue_wait"]["count"].as_u64().unwrap() >= 1,
+        "queue wait never recorded: {stats}"
+    );
+
+    // A request that has finished must not still be counted as in flight.
+    assert_eq!(stats["active"], 0, "the in-flight gauge leaked: {stats}");
+
+    let prom = s.get("/metrics").await.text().await.unwrap();
+    for family in [
+        "sluice_ttft_ms",
+        "sluice_tokens_per_second",
+        "sluice_queue_wait_ms",
+        "sluice_finish_reason_total",
+        "sluice_request_shape",
+        "sluice_events_total",
+        "sluice_stream_requests_total",
+        "sluice_active_requests",
+    ] {
+        assert!(prom.contains(family), "{family} missing from /metrics");
+    }
+}
+
+/// An unauthorized attempt should be countable — it is the signal that someone
+/// is probing, and it was previously invisible.
+#[tokio::test]
+async fn refusals_are_counted() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "mock", &mock, "k1")
+        .await;
+
+    for _ in 0..3 {
+        s.client
+            .post(format!("{}/v1/chat/completions", s.base_url))
+            .header("authorization", "Bearer slk_wrong")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    s.login("admin", "password123").await;
+    let stats: serde_json::Value = s.get("/api/stats").await.json().await.unwrap();
+    let unauthorized = stats["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "unauthorized")
+        .map(|e| e["count"].as_u64().unwrap())
+        .unwrap_or(0);
+    assert_eq!(unauthorized, 3, "refusals not counted: {stats}");
+}

@@ -128,6 +128,10 @@
   tbody tr:hover td.name { color: var(--accent); }
   td.name { color: var(--ink); }
   .muted { color: var(--dim); }
+  /* Two cues worth having: a slow worst-case first token, and truncation.
+     Both mean "look here" and neither is an error the status column shows. */
+  td.slow  { color: var(--warn); }
+  td.warnv { color: var(--err); }
   .chip {
     display: inline-block; padding: 0 5px; border-radius: 0; font-size: 11px;
     border: 1px solid var(--line-2); color: var(--ink-2);
@@ -253,7 +257,12 @@
         <thead><tr>
           <th data-k="model">Model</th>
           <th class="num" data-k="requests">Requests</th>
+          <th class="num" data-k="avg_ttft_ms">TTFT</th>
+          <th class="num" data-k="max_ttft_ms">TTFT max</th>
+          <th class="num" data-k="avg_tokens_per_sec">Tok/s</th>
           <th class="num" data-k="avg_latency_ms">Avg latency</th>
+          <th class="num" data-k="truncated">Truncated</th>
+          <th class="num" data-k="tool_calls">Tool calls</th>
           <th class="num" data-k="prompt_tokens">Prompt tok</th>
           <th class="num" data-k="completion_tokens">Compl tok</th>
         </tr></thead>
@@ -267,7 +276,15 @@
     <div class="panel card">
       <h2>Clients — who's calling</h2>
       <table id="tbl-clients">
-        <thead><tr><th data-k="client">Client</th><th class="num" data-k="requests">Requests</th><th class="num">Share</th></tr></thead>
+        <thead><tr>
+          <th data-k="client">Client</th>
+          <th class="num" data-k="requests">Requests</th>
+          <th class="num">Share</th>
+          <th class="num">Conv depth</th>
+          <th class="num">Tools</th>
+          <th class="num">Output cap</th>
+          <th class="num">Temp</th>
+        </tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -301,6 +318,8 @@
     <div class="tiles" style="margin-bottom:14px">
       <div class="panel tile"><div class="k">Success rate</div><div class="v" id="r-succ">–</div></div>
       <div class="panel tile"><div class="k">Errors</div><div class="v" id="r-err">0</div></div>
+      <div class="panel tile"><div class="k">In flight</div><div class="v" id="r-active">0</div></div>
+      <div class="panel tile"><div class="k">Queue wait</div><div class="v" id="r-qwait">0<small> ms avg</small></div></div>
     </div>
     <div class="panel card">
       <h2>Outcomes — by status code</h2>
@@ -311,6 +330,20 @@
     </div>
   </div>
 
+
+    <div class="panel card" style="margin-top:8px">
+      <h2>What happened to requests — retries, benches, sheds, refusals</h2>
+      <div id="r-events"></div>
+      <div class="muted" style="font-size:11px;margin-top:6px">
+        These were only ever visible in the log. A retry absorbed is a client
+        error prevented; a rising bench count means a provider is pushing back.
+      </div>
+    </div>
+    <div class="panel card" style="margin-top:8px">
+      <h2>Streaming vs buffered</h2>
+      <div id="r-mix"></div>
+    </div>
+  </div>
 
   <!-- SETTINGS -->
   <div id="settings" class="tab hidden">
@@ -495,23 +528,39 @@
     t.querySelectorAll("th[data-k]").forEach((th) => th.onclick = () => renderTable(tid, sortRows(rowsFn(), th.dataset.k, tid)));
   }
 
+  // A latency reads better as "1.4 s" than as "1402 ms" past a second.
+  const ms = (v) => !v ? "<span class=muted>–</span>"
+    : v >= 1000 ? (v / 1000).toFixed(1) + " s" : nfmt(v) + " ms";
+
   function renderTable(tid, rows) {
     const body = $(tid).querySelector("tbody");
     if (tid === "tbl-models") {
       body.innerHTML = rows.length ? rows.map((m) => `<tr>
         <td class="name">${esc(m.model)}</td>
         <td class="num">${nfmt(m.requests)}</td>
-        <td class="num">${m.avg_latency_ms ? nfmt(m.avg_latency_ms) + " ms" : "<span class=muted>–</span>"}</td>
+        <td class="num">${ms(m.avg_ttft_ms)}</td>
+        <td class="num ${m.max_ttft_ms > 10000 ? "slow" : ""}">${ms(m.max_ttft_ms)}</td>
+        <td class="num">${m.avg_tokens_per_sec ? nfmt(m.avg_tokens_per_sec) : "<span class=muted>–</span>"}</td>
+        <td class="num">${ms(m.avg_latency_ms)}</td>
+        <td class="num ${m.truncated ? "warnv" : ""}">${m.truncated ? nfmt(m.truncated) : "<span class=muted>0</span>"}</td>
+        <td class="num">${m.tool_calls ? nfmt(m.tool_calls) : "<span class=muted>0</span>"}</td>
         <td class="num">${nfmt(m.prompt_tokens)}</td>
         <td class="num">${nfmt(m.completion_tokens)}</td></tr>`).join("")
-        : emptyRow(5);
+        : emptyRow(10);
     } else if (tid === "tbl-clients") {
       const total = rows.reduce((s, r) => s + r.requests, 0) || 1;
-      body.innerHTML = rows.length ? rows.map((c) => `<tr>
+      const shapeOf = (name) => (stats.shape || []).find((x) => x.client === name) || {};
+      body.innerHTML = rows.length ? rows.map((c) => {
+        const sh = shapeOf(c.client);
+        return `<tr>
         <td class="name">${esc(c.client)}</td>
         <td class="num">${nfmt(c.requests)}</td>
-        <td class="num muted">${pct(c.requests / total)}</td></tr>`).join("")
-        : emptyRow(3);
+        <td class="num muted">${pct(c.requests / total)}</td>
+        <td class="num">${sh.avg_messages ?? "<span class=muted>–</span>"}</td>
+        <td class="num">${sh.avg_tools ?? "<span class=muted>–</span>"}</td>
+        <td class="num">${sh.avg_max_tokens ? nfmt(sh.avg_max_tokens) : "<span class=muted>–</span>"}</td>
+        <td class="num">${sh.avg_temperature_x100 != null ? (sh.avg_temperature_x100 / 100).toFixed(2) : "<span class=muted>–</span>"}</td></tr>`;
+      }).join("") : emptyRow(7);
     } else if (tid === "tbl-status") {
       body.innerHTML = rows.length ? rows.map((s) => `<tr>
         <td class="name">${esc(s.status)}</td>
@@ -528,7 +577,28 @@
   function renderReliability() {
     $("r-succ").textContent = pct(successRate());
     $("r-err").textContent = nfmt(errorCount());
+    $("r-active").textContent = nfmt(stats.active || 0);
+    const q = stats.queue_wait || {};
+    const qavg = q.count ? Math.round(q.sum / q.count) : 0;
+    $("r-qwait").innerHTML = nfmt(qavg) + "<small> ms avg</small>" +
+      (q.max ? ` <span class="muted">max ${nfmt(q.max)}</span>` : "");
     renderTable("tbl-status", [...(stats.statuses || [])].sort((a, b) => b.count - a.count));
+
+    const evs = [...(stats.events || [])].sort((a, b) => b.count - a.count);
+    const worst = Math.max(1, ...evs.map((e) => e.count));
+    $("r-events").innerHTML = evs.length ? evs.map((e) => `<div class="lane">
+        <span class="lbl">${esc(e.kind)}</span><span class="val">${nfmt(e.count)}</span>
+        <div class="meter"><i style="width:${(e.count / worst * 100).toFixed(1)}%"></i></div>
+      </div>`).join("") : `<div class="empty">nothing has gone wrong yet</div>`;
+
+    const st = stats.streamed || 0, bf = stats.buffered || 0, tot = st + bf || 1;
+    $("r-mix").innerHTML = `<div class="lane">
+        <span class="lbl">streaming</span><span class="val">${nfmt(st)} · ${pct(st / tot)}</span>
+        <div class="meter"><i style="width:${(st / tot * 100).toFixed(1)}%"></i></div>
+      </div><div class="lane">
+        <span class="lbl">buffered</span><span class="val">${nfmt(bf)} · ${pct(bf / tot)}</span>
+        <div class="meter"><i style="width:${(bf / tot * 100).toFixed(1)}%"></i></div>
+      </div>`;
   }
   function renderCapacity() {
     $("c-lanes").textContent = cfg.lanes ?? "–";

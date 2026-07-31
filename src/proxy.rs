@@ -71,6 +71,8 @@ fn overloaded() -> Response {
 }
 
 fn deadline_exceeded() -> Response {
+    // Counted by the caller via record_event("deadline") where the state is in
+    // scope; this only builds the response.
     err(
         StatusCode::GATEWAY_TIMEOUT,
         "deadline_exceeded",
@@ -226,6 +228,7 @@ fn bench_lane(state: &AppState, lane_idx: usize, model: &str, status: u16, heade
     let pool = state.pool.read().unwrap().clone();
     if let Some(lane) = pool.lanes().get(lane_idx) {
         lane.bench(Instant::now() + cooldown);
+        state.metrics.record_event("lane_benched");
         // Retries are invisible in the access log, which only records how a
         // request finally ended. Without this line an operator can see that the
         // governor engaged but has no way to count the pushback behind it.
@@ -469,6 +472,7 @@ pub async fn handle(
         .and_then(|s| s.strip_prefix("Bearer "))
         .and_then(|k| auth::verify_client_key(k, &clients));
     let Some(client) = client else {
+        state.metrics.record_event("unauthorized");
         return err(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -489,6 +493,7 @@ pub async fn handle(
     // paid. The guard rides the whole request and frees its slot on drop.
     let max_inflight = { state.store.lock().unwrap().settings.max_inflight };
     let Some(inflight) = try_admit(&state.inflight, max_inflight) else {
+        state.metrics.record_event("shed");
         return overloaded();
     };
 
@@ -532,9 +537,33 @@ pub async fn handle(
     let model_label = requested.clone().unwrap_or_else(|| "unknown".to_string());
     let session = parsed.as_ref().and_then(session_key);
 
+    // What the harness asked for, in counts and sizes only. Conversation depth
+    // and output budget are the two that explain a bill; temperature and tool
+    // count explain behaviour that otherwise looks like the model changing.
+    if let Some(v) = parsed.as_ref() {
+        let n = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_array())
+                .map(|a| a.len() as u64)
+                .unwrap_or(0)
+        };
+        let temp_x100 = v
+            .get("temperature")
+            .and_then(|t| t.as_f64())
+            .map(|t| (t * 100.0) as u64)
+            .unwrap_or(0);
+        let max_tok = v.get("max_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+        state
+            .metrics
+            .record_shape(&client, n("messages"), n("tools"), max_tok, temp_x100);
+    }
+    let streaming = parsed.as_ref().is_some_and(wants_stream);
+    state.metrics.record_stream_mix(streaming);
+    let _active = state.metrics.track_active();
+
     // Streaming: commit 200 text/event-stream now and drive the request in a worker
     // that heartbeats while it paces/retries, then relays the upstream SSE body.
-    if parsed.as_ref().is_some_and(wants_stream) {
+    if streaming {
         // Ask for exact token counts unless this model has already told us it
         // rejects the field; keep the original so that can be undone per request.
         let injected = (!state.no_inject.lock().unwrap().contains(&model_label))
@@ -580,9 +609,11 @@ pub async fn handle(
         // yet shouldn't be holding a key's budget while it waits.
         let step_model = step.model.as_deref().unwrap_or(&model_label);
         let Some(_model_permit) = admit_model(&state, step_model, deadline, || true).await else {
+            state.metrics.record_event("deadline");
             record(&state, &client, &model_label, &path_query, "504", None, t0);
             return deadline_exceeded();
         };
+        let queued_at = Instant::now();
         let permit = match with_deadline(
             deadline,
             state
@@ -592,12 +623,18 @@ pub async fn handle(
         .await
         {
             None => {
+                state.metrics.record_event("deadline");
                 record(&state, &client, &model_label, &path_query, "504", None, t0);
                 return deadline_exceeded();
             }
             Some(None) => continue, // no eligible lane for this target
             Some(Some(p)) => p,
         };
+        // Distinguishes "our pool is the bottleneck" from "the provider is
+        // slow" — end to end they look identical.
+        state
+            .metrics
+            .record_queue_wait(queued_at.elapsed().as_millis() as u64);
         let out_body = rewrite_model(&body, step.model.as_deref());
         let upstream_at = Instant::now();
         let send = build_request(
@@ -612,6 +649,7 @@ pub async fn handle(
         let sent = match with_deadline(deadline, send).await {
             Some(r) => r,
             None => {
+                state.metrics.record_event("deadline");
                 record(&state, &client, &model_label, &path_query, "504", None, t0);
                 return deadline_exceeded();
             }
@@ -650,7 +688,21 @@ pub async fn handle(
                     .metrics
                     .record_latency(&model_label, upstream_at.elapsed().as_millis() as u64);
                 state.metrics.record_lane(&permit.provider);
-                return relay(&state, &model_label, resp).await;
+                // Headers back = first byte from upstream; whatever follows is
+                // generation. On a buffered call these are the two halves of the
+                // wait, and only the first one moves when a provider degrades.
+                state
+                    .metrics
+                    .record_ttft(&model_label, upstream_at.elapsed().as_millis() as u64);
+                let gen_start = Instant::now();
+                let out = relay(
+                    &state,
+                    &model_label,
+                    gen_start.elapsed().as_millis() as u64,
+                    resp,
+                )
+                .await;
+                return out;
             }
             Err(e) => {
                 if !is_last {
@@ -684,7 +736,12 @@ pub async fn handle(
 
 /// Relay a buffered upstream response back to the client, recording token usage
 /// (content-blind — only the counts from the `usage` object, never the text).
-async fn relay(state: &Arc<AppState>, model: &str, upstream: reqwest::Response) -> Response {
+async fn relay(
+    state: &Arc<AppState>,
+    model: &str,
+    gen_ms: u64,
+    upstream: reqwest::Response,
+) -> Response {
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut out = HeaderMap::new();
@@ -695,18 +752,50 @@ async fn relay(state: &Arc<AppState>, model: &str, upstream: reqwest::Response) 
     }
     let payload = upstream.bytes().await.unwrap_or_default();
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
-        if let Some(u) = v.get("usage") {
-            let p = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-            let c = u
-                .get("completion_tokens")
-                .and_then(|x| x.as_u64())
+        harvest(state, model, gen_ms, &v);
+    }
+    (status, out, payload).into_response()
+}
+
+/// Pull every measurement an OpenAI-shaped response carries about itself.
+///
+/// Content-blind throughout: counts, reasons and durations, never a byte of the
+/// message. `finish_reason` matters more than it looks — `length` means the
+/// answer was cut off at the output cap, which reads as a stupid model until you
+/// can see it was truncated.
+fn harvest(state: &Arc<AppState>, model: &str, gen_ms: u64, v: &serde_json::Value) {
+    if let Some(u) = v.get("usage") {
+        let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let (p, c) = (n("prompt_tokens"), n("completion_tokens"));
+        if p > 0 || c > 0 {
+            state.metrics.record_tokens(model, p, c);
+        }
+        state.metrics.record_speed(model, c, gen_ms);
+        let reasoning = u
+            .get("completion_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        if reasoning > 0 {
+            state.metrics.record_extras(model, 0, reasoning);
+        }
+    }
+    if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+        for ch in choices {
+            if let Some(r) = ch.get("finish_reason").and_then(|r| r.as_str()) {
+                state.metrics.record_finish(model, r);
+            }
+            let calls = ch
+                .get("message")
+                .and_then(|m| m.get("tool_calls"))
+                .and_then(|t| t.as_array())
+                .map(|a| a.len() as u64)
                 .unwrap_or(0);
-            if p > 0 || c > 0 {
-                state.metrics.record_tokens(model, p, c);
+            if calls > 0 {
+                state.metrics.record_extras(model, calls, 0);
             }
         }
     }
-    (status, out, payload).into_response()
 }
 
 // --- Streaming path ----------------------------------------------------------
@@ -805,6 +894,7 @@ async fn stream_proxy(
         let step_model = step.model.as_deref().unwrap_or(&model);
         let beat = || tx.try_send(heartbeat_frame()).is_ok() || !tx.is_closed();
         let Some(_model_permit) = admit_model(&state, step_model, deadline, beat).await else {
+            state.metrics.record_event("deadline");
             record(&state, &client, &model, &path_query, "504", None, t0);
             let _ = tx.send(sse_error("deadline_exceeded")).await;
             return;
@@ -822,12 +912,17 @@ async fn stream_proxy(
             Ok(Some(p)) => p,
             Ok(None) => continue,
             Err(()) => {
+                state.metrics.record_event("deadline");
                 record(&state, &client, &model, &path_query, "504", None, t0);
                 let _ = tx.send(sse_error("deadline_exceeded")).await;
                 return;
             }
         };
-        let sent = loop {
+        // The send time comes back with the response so time-to-first-token is
+        // measured from the attempt that actually produced it, not from the
+        // first attempt of a step that retried.
+        let (sent, upstream_at) = loop {
+            let attempt_at = Instant::now();
             let out_body = rewrite_model(&body, step.model.as_deref());
             let send = build_request(
                 &state,
@@ -841,6 +936,7 @@ async fn stream_proxy(
             let sent = match with_deadline(deadline, send).await {
                 Some(r) => r,
                 None => {
+                    state.metrics.record_event("deadline");
                     record(&state, &client, &model, &path_query, "504", None, t0);
                     let _ = tx.send(sse_error("deadline_exceeded")).await;
                     return;
@@ -856,7 +952,7 @@ async fn stream_proxy(
                 retried_plain = true;
                 continue;
             }
-            break sent;
+            break (sent, attempt_at);
         };
         match sent {
             Ok(resp) => {
@@ -892,7 +988,7 @@ async fn stream_proxy(
                     t0,
                 );
                 state.metrics.record_lane(&permit.provider);
-                stream_body(resp, deadline, &tx).await;
+                stream_body(&state, &model, upstream_at, resp, deadline, &tx).await;
                 return;
             }
             Err(_) => {
@@ -918,23 +1014,72 @@ async fn stream_proxy(
     let _ = tx.send(sse_error("no_capacity")).await;
 }
 
-/// Forward the upstream response body chunk-by-chunk into the client stream.
-async fn stream_body(resp: reqwest::Response, deadline: Option<Instant>, tx: &Tx) {
+/// Forward the upstream response body chunk-by-chunk into the client stream,
+/// measuring it on the way past.
+///
+/// This is where time-to-first-token is a real measurement rather than an
+/// approximation: the gap to the first chunk is exactly what a user experiences
+/// as "did it hear me". Everything after that is generation speed. The final
+/// SSE frame carries usage when `stream_options` was accepted, which is what
+/// the injection exists to obtain.
+async fn stream_body(
+    state: &Arc<AppState>,
+    model: &str,
+    sent_at: Instant,
+    resp: reqwest::Response,
+    deadline: Option<Instant>,
+    tx: &Tx,
+) {
     use futures_util::StreamExt;
     let mut stream = Box::pin(resp.bytes_stream());
+    let mut first_seen: Option<Instant> = None;
+    let mut tail = String::new();
     loop {
         match with_deadline(deadline, stream.next()).await {
             None => {
+                state.metrics.record_event("deadline");
                 let _ = tx.send(sse_error("deadline_exceeded")).await;
                 return;
             }
-            Some(None) => return, // upstream finished cleanly
+            Some(None) => {
+                // Usage and finish_reason arrive in the last frames, so they are
+                // only readable once the stream has ended.
+                if let Some(started) = first_seen {
+                    let gen_ms = started.elapsed().as_millis() as u64;
+                    for line in tail.lines() {
+                        let Some(rest) = line.strip_prefix("data: ") else {
+                            continue;
+                        };
+                        if rest.trim() == "[DONE]" {
+                            continue;
+                        }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) {
+                            harvest(state, model, gen_ms, &v);
+                        }
+                    }
+                }
+                return;
+            }
             Some(Some(Ok(chunk))) => {
+                if first_seen.is_none() {
+                    first_seen = Some(Instant::now());
+                    state
+                        .metrics
+                        .record_ttft(model, sent_at.elapsed().as_millis() as u64);
+                }
+                // Keep only a trailing window: usage rides in the last frames and
+                // buffering a whole generation to find it would defeat streaming.
+                tail.push_str(&String::from_utf8_lossy(&chunk));
+                if tail.len() > 8192 {
+                    tail = tail.split_off(tail.len() - 4096);
+                }
                 if tx.send(Ok(chunk)).await.is_err() {
+                    state.metrics.record_event("client_disconnect");
                     return; // client hung up
                 }
             }
             Some(Some(Err(_))) => {
+                state.metrics.record_event("stream_error");
                 let _ = tx.send(sse_error("stream_error")).await;
                 return;
             }
