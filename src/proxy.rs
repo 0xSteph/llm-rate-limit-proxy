@@ -97,8 +97,14 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+/// Statuses worth another attempt on a different key.
+///
+/// 529 is not in any RFC but providers use it for "temporarily overloaded" —
+/// NVIDIA returned it in production and it went straight to the client as a
+/// terminal error, which is the opposite of what it means. 408 is the same
+/// shape: the request timed out, not the request was wrong.
 fn is_retryable(status: u16) -> bool {
-    matches!(status, 429 | 500 | 502 | 503 | 504)
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 /// Collapse a duplicated `/v1` prefix before forwarding.
@@ -899,6 +905,7 @@ async fn stream_proxy(
             let _ = tx.send(sse_error("deadline_exceeded")).await;
             return;
         };
+        let queued_at = Instant::now();
         let permit = match acquire_for_heartbeating(
             &state,
             step.provider.as_deref(),
@@ -909,7 +916,12 @@ async fn stream_proxy(
         )
         .await
         {
-            Ok(Some(p)) => p,
+            Ok(Some(p)) => {
+                state
+                    .metrics
+                    .record_queue_wait(queued_at.elapsed().as_millis() as u64);
+                p
+            }
             Ok(None) => continue,
             Err(()) => {
                 state.metrics.record_event("deadline");
@@ -1127,6 +1139,19 @@ mod tests {
     /// it themselves. Set both and the client sends `/v1/v1/chat/completions`,
     /// which forwards to a provider route that does not exist and returns a bare
     /// "404 page not found" naming nothing and pointing at nothing.
+    /// Observed in production: NVIDIA answered 529 "Service temporarily
+    /// overloaded" and it reached the client verbatim, because 529 is not in any
+    /// RFC and was not in the list. It means retry, so it must be retried.
+    #[test]
+    fn overload_and_timeout_statuses_are_retried() {
+        for status in [408, 429, 500, 502, 503, 504, 529] {
+            assert!(is_retryable(status), "{status} should be retried");
+        }
+        for status in [200, 400, 401, 403, 404, 422] {
+            assert!(!is_retryable(status), "{status} must not be retried");
+        }
+    }
+
     #[test]
     fn a_doubled_version_prefix_is_collapsed() {
         assert_eq!(
