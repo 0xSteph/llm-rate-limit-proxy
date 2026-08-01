@@ -740,6 +740,23 @@ pub async fn handle(
     )
 }
 
+/// Did upstream answer `200 OK` with a completion containing nothing?
+///
+/// NVIDIA does exactly this when a request's input plus its `max_tokens` exceeds
+/// the model's window: no choices, null usage, and no error of any kind. Only
+/// overflowing on input *alone* produces an honest 400. Relaying the empty one
+/// unchanged hands the client a success carrying no answer, which surfaces in an
+/// agent harness as an internal error pointing nowhere near the real cause.
+///
+/// Streaming chunks legitimately carry an empty `choices` array, so this matches
+/// on the buffered `chat.completion` object only.
+fn is_empty_completion(v: &serde_json::Value) -> bool {
+    v.get("object").and_then(|o| o.as_str()) == Some("chat.completion")
+        && v.get("choices")
+            .and_then(|c| c.as_array())
+            .is_some_and(|c| c.is_empty())
+}
+
 /// Relay a buffered upstream response back to the client, recording token usage
 /// (content-blind — only the counts from the `usage` object, never the text).
 async fn relay(
@@ -759,6 +776,15 @@ async fn relay(
     let payload = upstream.bytes().await.unwrap_or_default();
     let gen_ms = gen_start.elapsed().as_millis() as u64;
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
+        if status.is_success() && is_empty_completion(&v) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "empty_completion",
+                "upstream returned a completion with no choices, which it does when \
+                 input plus max_tokens exceeds the model's context window — reduce \
+                 either and retry",
+            );
+        }
         harvest(&state.metrics, model, gen_ms, &v);
     }
     (status, out, payload).into_response()
@@ -1172,6 +1198,29 @@ mod tests {
         assert_eq!(m.truncated, 1, "finish_reason=length is truncation");
         assert_eq!(m.tool_calls, 2, "tool calls");
         assert_eq!(m.reasoning_tokens, 40, "reasoning tokens");
+    }
+
+    #[test]
+    fn a_success_carrying_no_choices_is_not_a_success() {
+        // NVIDIA answers an over-long request with 200 OK and this exact shape:
+        // no choices, null usage, no error anywhere. Verified against the
+        // provider directly, with the proxy out of the path.
+        let overflowed = json(
+            r#"{"id":"","choices":[],"created":0,"model":"","object":"chat.completion","usage":null}"#,
+        );
+        assert!(
+            is_empty_completion(&overflowed),
+            "an empty choices array is never a valid completion"
+        );
+
+        // A real answer, a streaming chunk, and an unrelated 200 must all pass.
+        assert!(!is_empty_completion(&json(
+            r#"{"object":"chat.completion","choices":[{"message":{"content":"hi"}}]}"#
+        )));
+        assert!(!is_empty_completion(&json(
+            r#"{"object":"chat.completion.chunk","choices":[]}"#
+        )));
+        assert!(!is_empty_completion(&json(r#"{"data":[{"id":"m"}]}"#)));
     }
 
     #[test]
