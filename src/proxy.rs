@@ -533,6 +533,32 @@ pub async fn handle(
         return serve_catalog(&state, &aliases, deadline).await;
     }
 
+    // `/v1/props` is llama.cpp's, and harnesses poll it for `n_ctx` because it is
+    // the only endpoint in common use that states a context window at all. Left
+    // unhandled it forwards upstream, spends a rate slot, and earns a 404 — so a
+    // client asking the one question we can now answer gets nothing, and pays for
+    // the privilege.
+    //
+    // Answered only once a ceiling has actually been learned. A guess here is
+    // worse than silence: silence leaves the client on its own default, while a
+    // wrong n_ctx is a number it will trust.
+    if method == Method::GET && route == "/v1/props" {
+        let Some(n_ctx) = state.context_limits.smallest() else {
+            return err(
+                StatusCode::NOT_FOUND,
+                "unknown_context",
+                "no context window observed yet for any model",
+            );
+        };
+        record(&state, &client, "props", &path_query, "200", None, t0);
+        return Json(serde_json::json!({
+            "default_generation_settings": { "n_ctx": n_ctx },
+            "n_ctx": n_ctx,
+            "total_slots": 1,
+        }))
+        .into_response();
+    }
+
     // Parsed exactly once. Four helpers need to look inside the body and an
     // agent transcript is the largest thing this process handles, so parsing it
     // per-helper was the most expensive avoidable work on the hot path. A body

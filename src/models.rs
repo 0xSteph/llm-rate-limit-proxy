@@ -48,6 +48,14 @@ impl Limits {
     pub fn known(&self, model: &str) -> Option<u64> {
         self.0.lock().unwrap().get(model).copied()
     }
+
+    /// The tightest ceiling seen across every model, for answers that cannot name
+    /// one. `/v1/props` is such an answer: it predates multi-model servers and
+    /// carries no model parameter, so the only safe figure is the one that holds
+    /// whichever model the caller goes on to use.
+    pub fn smallest(&self) -> Option<u64> {
+        self.0.lock().unwrap().values().copied().min()
+    }
 }
 
 pub struct Catalog {
@@ -235,6 +243,19 @@ mod tests {
 
         // A model we have never overflowed must claim nothing rather than guess.
         assert!(merged["data"][1].get("context_length").is_none());
+    }
+
+    #[test]
+    fn with_no_model_named_we_advertise_the_tightest_ceiling() {
+        let l = Limits::default();
+        assert_eq!(l.smallest(), None, "claim nothing before we have learned");
+        l.learn("roomy", 202_752);
+        l.learn("tight", 131_072);
+        assert_eq!(
+            l.smallest(),
+            Some(131_072),
+            "must hold for whichever model the caller picks"
+        );
     }
 
     #[test]
