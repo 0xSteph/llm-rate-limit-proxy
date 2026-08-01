@@ -3,6 +3,7 @@ pub mod config;
 pub mod dispatch;
 pub mod governor;
 pub mod history;
+pub mod ledger;
 pub mod metrics;
 pub mod models;
 pub mod net;
@@ -48,6 +49,8 @@ pub struct AppState {
     pub governor: Arc<governor::Governor>,
     /// Cached per-provider model catalogs behind the merged `/v1/models`.
     pub catalog: Arc<models::Catalog>,
+    /// Lifetime per-model token totals, persisted, for the savings view.
+    pub ledger: Arc<ledger::Ledger>,
     /// Context windows learned from providers refusing over-long requests, then
     /// published in `/v1/models` so clients stop having to guess.
     pub context_limits: models::Limits,
@@ -57,6 +60,44 @@ pub struct AppState {
     pub metrics: metrics::Metrics,
     /// Persisted 5-minute snapshots for range views.
     pub history: Arc<history::History>,
+}
+
+/// This process's per-model counters, in the shape the ledger folds onto its
+/// persisted baseline.
+fn per_model_usage(state: &Arc<AppState>) -> Vec<(String, ledger::Usage)> {
+    state
+        .metrics
+        .stats()
+        .models
+        .into_iter()
+        .map(|m| {
+            (
+                m.model,
+                ledger::Usage {
+                    requests: m.requests,
+                    prompt_tokens: m.prompt_tokens,
+                    completion_tokens: m.completion_tokens,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Lifetime usage priced at the configured rates.
+///
+/// Absorbs before reading so the figure includes the current tick rather than
+/// lagging up to five minutes behind — the difference is invisible on a long
+/// view and glaring when someone opens the tab right after a big session.
+async fn api_savings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.ledger.absorb(&per_model_usage(&state));
+    let rates = {
+        let store = state.store.lock().unwrap();
+        store.settings.model_rates.clone()
+    };
+    Json(serde_json::json!({
+        "rows": state.ledger.savings(&rates),
+        "default_rate": ledger::DEFAULT_RATE,
+    }))
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -261,6 +302,10 @@ pub async fn run() {
         stored.settings.history_days,
     ));
 
+    // Deliberately not covered by history retention: a lifetime total that gets
+    // pruned is not a lifetime total.
+    let ledger = Arc::new(ledger::Ledger::load(Some(data_dir.join("usage.json"))));
+
     // Undocumented test knob; 60s is the contract. Lets pacing tests run fast.
     let provider_window = env_or("SLUICE_PROVIDER_WINDOW_MS", "")
         .parse::<u64>()
@@ -287,6 +332,7 @@ pub async fn run() {
         governor: Arc::new(governor::Governor::default()),
         catalog: Arc::new(models::Catalog::new(Duration::from_secs(models_ttl))),
         context_limits: models::Limits::default(),
+        ledger: ledger.clone(),
         no_inject: Mutex::new(std::collections::HashSet::new()),
         pool,
         http,
@@ -309,6 +355,9 @@ pub async fn run() {
         tokio::spawn(async move {
             loop {
                 history.append(unix_now(), sampled.metrics.total());
+                // Same tick, because both answer "what has happened here" and a
+                // separate timer would only add a second thing to reason about.
+                sampled.ledger.absorb(&per_model_usage(&sampled));
                 tokio::time::sleep(Duration::from_secs(sample_secs)).await;
             }
         });
@@ -331,6 +380,7 @@ pub async fn run() {
         .route("/dash", get(root))
         .route("/api/history", get(api_history))
         .route("/api/stats", get(api_stats))
+        .route("/api/savings", get(api_savings))
         .route("/api/pressure", get(api_pressure))
         .route("/api/settings", get(settings::view))
         // Minting and revoking a client credential is self-service: someone who

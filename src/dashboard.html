@@ -223,6 +223,7 @@
     <button data-tab="overview" aria-selected="true">Overview</button>
     <button data-tab="models">Models</button>
     <button data-tab="clients">Clients</button>
+    <button data-tab="savings">Savings</button>
     <button data-tab="capacity">Capacity</button>
     <button data-tab="reliability">Reliability</button>
     <button data-tab="settings">Settings</button>
@@ -268,6 +269,32 @@
         </tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- SAVINGS -->
+  <div id="savings" class="tab hidden">
+    <div class="tiles">
+      <div class="panel tile accent"><div class="k">Avoided spend</div><div class="v" id="sv-total">$0</div></div>
+      <div class="panel tile"><div class="k">Tokens served</div><div class="v" id="sv-tok">0</div></div>
+      <div class="panel tile"><div class="k">Requests</div><div class="v" id="sv-req">0</div></div>
+      <div class="panel tile"><div class="k">Actually paid</div><div class="v" id="sv-paid">$0</div></div>
+    </div>
+    <div class="panel card">
+      <h2>By model — lifetime, across restarts</h2>
+      <table id="tbl-savings">
+        <thead><tr>
+          <th>Model</th>
+          <th class="num">Requests</th>
+          <th class="num">Prompt tok</th>
+          <th class="num">Compl tok</th>
+          <th class="num">In $/Mtok</th>
+          <th class="num">Out $/Mtok</th>
+          <th class="num">Avoided</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="muted" id="sv-note" style="font-size:11px;margin-top:8px"></div>
     </div>
   </div>
 
@@ -427,7 +454,7 @@
   const pct = (n) => (n * 100).toFixed(n >= 0.9995 ? 0 : 1) + "%";
   const classOf = (s) => { const c = +s; return c && c < 400 ? "ok" : "err"; };
 
-  let cfg = {}, stats = {}, hist = [], pressure = [];
+  let cfg = {}, stats = {}, hist = [], pressure = [], savings = {};
   const sortState = {}; // per-table
 
   async function getJSON(url) {
@@ -794,8 +821,47 @@
     });
   });
 
+  // Money is the one figure people quote at each other, so it is shown to the
+  // cent below $100 and rounded above — a headline reading $1,247.83 invites a
+  // precision the underlying rate table cannot support.
+  function usd(n) {
+    if (n >= 100) return "$" + Math.round(n).toLocaleString();
+    if (n >= 1) return "$" + n.toFixed(2);
+    if (n > 0) return "$" + n.toFixed(3);
+    return "$0";
+  }
+
+  function renderSavings() {
+    const rows = (savings && savings.rows) || [];
+    const total = rows.reduce((a, r) => a + r.usd, 0);
+    const tok = rows.reduce((a, r) => a + r.prompt_tokens + r.completion_tokens, 0);
+    const req = rows.reduce((a, r) => a + r.requests, 0);
+    $("sv-total").textContent = usd(total);
+    $("sv-tok").textContent = nfmt(tok);
+    $("sv-req").textContent = nfmt(req);
+    $("sv-paid").textContent = "$0";
+
+    const body = $("tbl-savings").querySelector("tbody");
+    body.innerHTML = rows.length ? rows.map((r) => `<tr>
+      <td class="name">${esc(r.model)}</td>
+      <td class="num">${nfmt(r.requests)}</td>
+      <td class="num">${nfmt(r.prompt_tokens)}</td>
+      <td class="num">${nfmt(r.completion_tokens)}</td>
+      <td class="num muted">${r.input_per_mtok.toFixed(2)}</td>
+      <td class="num muted">${r.output_per_mtok.toFixed(2)}</td>
+      <td class="num">${usd(r.usd)}</td>
+    </tr>`).join("") : `<tr><td colspan="7" class="muted">No usage recorded yet.</td></tr>`;
+
+    const d = savings && savings.default_rate;
+    $("sv-note").textContent = d
+      ? `What this traffic would have cost at the rates shown, against $0 actually spent on free tiers. `
+        + `Models without a configured rate are priced at the $${d.input_per_mtok.toFixed(2)}/$${d.output_per_mtok.toFixed(2)} default. `
+        + `Rates are assumptions and editable in config; totals persist across restarts.`
+      : "";
+  }
+
   function renderAll() {
-    renderStrip(); renderOverview(); renderModels(); renderClients(); renderCapacity(); renderReliability(); renderSettings();
+    renderStrip(); renderOverview(); renderModels(); renderClients(); renderCapacity(); renderReliability(); renderSavings(); renderSettings();
   }
 
   // Tabs
@@ -813,12 +879,12 @@
 
   async function refresh() {
     try {
-      const [c, s, h, p] = await Promise.all([
+      const [c, s, h, p, v] = await Promise.all([
         getJSON("/dash/config.json"), getJSON("/api/stats"), getJSON("/api/history"),
-        getJSON("/api/pressure"),
+        getJSON("/api/pressure"), getJSON("/api/savings"),
       ]);
       if (!c) return; // redirected to login
-      cfg = c; stats = s; hist = h || []; pressure = (p && p.pressured) || [];
+      cfg = c; stats = s; hist = h || []; pressure = (p && p.pressured) || []; savings = v || {};
       $("s-live").textContent = "live";
       renderAll();
     } catch (err) {

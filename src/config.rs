@@ -118,6 +118,48 @@ pub struct Settings {
     /// Loopback is always allowed regardless.
     #[serde(default)]
     pub allow_from: Vec<String>,
+    /// What each model would cost per million tokens at a paid provider, used to
+    /// price the savings view. An assumption rather than a measurement — free
+    /// tiers cost nothing, so the interesting figure is the counterfactual — and
+    /// therefore editable, with the rate shown beside every row it produced.
+    #[serde(default = "default_model_rates")]
+    pub model_rates: std::collections::HashMap<String, crate::ledger::Rate>,
+}
+
+/// Opening assumptions for the savings view, in USD per million tokens.
+///
+/// Rounded from published list prices for the same models on paid providers at
+/// the time of writing. They drift, which is why they are configurable; the
+/// console shows which rate produced each row so a stale number is visible
+/// rather than silently wrong.
+fn default_model_rates() -> std::collections::HashMap<String, crate::ledger::Rate> {
+    use crate::ledger::Rate;
+    [
+        (
+            "z-ai/glm-5.2",
+            Rate {
+                input_per_mtok: 0.60,
+                output_per_mtok: 2.00,
+            },
+        ),
+        (
+            "deepseek-ai/deepseek-v4-pro",
+            Rate {
+                input_per_mtok: 0.28,
+                output_per_mtok: 1.10,
+            },
+        ),
+        (
+            "deepseek-ai/deepseek-v4-flash",
+            Rate {
+                input_per_mtok: 0.07,
+                output_per_mtok: 0.30,
+            },
+        ),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
 }
 
 fn default_history_days() -> u32 {
@@ -144,6 +186,7 @@ impl Default for Settings {
             max_inflight: default_max_inflight(),
             models_ttl_secs: default_models_ttl_secs(),
             allow_from: Vec::new(),
+            model_rates: default_model_rates(),
         }
     }
 }
