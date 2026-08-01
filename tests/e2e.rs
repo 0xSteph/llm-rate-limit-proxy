@@ -1518,3 +1518,78 @@ async fn refusals_are_counted() {
         .unwrap_or(0);
     assert_eq!(unauthorized, 3, "refusals not counted: {stats}");
 }
+
+/// The allowlist has to actually refuse, and has to refuse before anything
+/// expensive happens — but must never lock out the machine it runs on.
+#[tokio::test]
+async fn a_source_allowlist_refuses_everyone_else_but_never_loopback() {
+    use sluice::auth::{hash_password, new_client_key};
+    use sluice::config::{
+        Provider, ProviderKey, Role, Settings, StoredConfig, User, STORE_VERSION,
+    };
+
+    let mock = support::start_mock_upstream().await;
+    let (client_secret, client_rec) = new_client_key("test", "admin");
+    let store = StoredConfig {
+        version: STORE_VERSION,
+        users: vec![User {
+            username: "admin".into(),
+            pw_hash: hash_password("password123"),
+            role: Role::Superuser,
+        }],
+        providers: vec![Provider {
+            name: "mock".into(),
+            base_url: mock.clone(),
+            keys: vec![ProviderKey {
+                key: "k".into(),
+                enabled: true,
+                rpm: 40,
+                owner: "admin".into(),
+            }],
+        }],
+        clients: vec![client_rec],
+        aliases: vec![],
+        // Admits one address on a network this test is not on. Every request
+        // here arrives from loopback, which must still be allowed.
+        settings: Settings {
+            allow_from: vec!["192.168.1.239".into()],
+            ..Default::default()
+        },
+    };
+    let s = Server::start_seeded(&store, &[]).await;
+
+    // The tests reach it over loopback, which is exempt by design.
+    assert_eq!(s.get("/health").await.status(), 200);
+    let r = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {client_secret}"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "loopback must never be locked out by an allowlist"
+    );
+}
+
+/// A rule that admits nothing must still leave /health answerable, or the
+/// supervisor kills a proxy that is working.
+#[tokio::test]
+async fn health_stays_reachable_regardless_of_the_allowlist() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "mock", &mock, "k1")
+        .await;
+    s.login("admin", "password123").await;
+    let r = settings_post(
+        &s,
+        "/api/settings/limits",
+        serde_json::json!({"max_inflight": 512}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(s.get("/health").await.status(), 200);
+}

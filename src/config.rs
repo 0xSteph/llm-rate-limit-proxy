@@ -112,6 +112,12 @@ pub struct Settings {
     pub max_inflight: usize,
     #[serde(default = "default_models_ttl_secs")]
     pub models_ttl_secs: u64,
+    /// Source addresses permitted to reach this proxy — bare IPs or CIDR blocks.
+    /// Empty means everyone, which is the default: a proxy that refused all
+    /// traffic the moment someone saved an empty field would be a bad surprise.
+    /// Loopback is always allowed regardless.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
 }
 
 fn default_history_days() -> u32 {
@@ -137,6 +143,7 @@ impl Default for Settings {
             history_days: default_history_days(),
             max_inflight: default_max_inflight(),
             models_ttl_secs: default_models_ttl_secs(),
+            allow_from: Vec::new(),
         }
     }
 }

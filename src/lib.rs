@@ -5,6 +5,7 @@ pub mod governor;
 pub mod history;
 pub mod metrics;
 pub mod models;
+pub mod net;
 pub mod pool;
 pub mod proxy;
 pub mod settings;
@@ -116,6 +117,45 @@ fn unix_now() -> u64 {
 /// Add hardening headers to every response. `default-src 'none'` plus explicit
 /// allowances for the dashboard's own inline assets; `connect-src 'self'` stops an
 /// injected element from exfiltrating to another origin.
+/// Refuse a caller whose source address is not on the allowlist.
+///
+/// Placed outermost so it applies to every route including the console, with one
+/// exception: `/health` stays open, because a load balancer or container probe
+/// has no way to be on the list and a proxy that reports itself unhealthy to its
+/// own supervisor is worse than one reachable from a machine that will get a 401
+/// anyway.
+async fn source_allowlist(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    let rules: Vec<net::Rule> = {
+        let store = state.store.lock().unwrap();
+        store
+            .settings
+            .allow_from
+            .iter()
+            .filter_map(|r| net::parse_rule(r))
+            .collect()
+    };
+    if net::permitted(&rules, peer.ip()) {
+        next.run(req).await
+    } else {
+        state.metrics.record_event("blocked_source");
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {"message": "source address not permitted", "code": "forbidden"}
+            })),
+        )
+            .into_response()
+    }
+}
+
 async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     use axum::http::HeaderValue;
     let mut resp = next.run(req).await;
@@ -318,6 +358,12 @@ pub async fn run() {
         .route("/setup", get(setup::setup_page).post(setup::setup_submit))
         .route("/v1/{*path}", any(proxy::handle))
         .layer(axum::middleware::from_fn(security_headers))
+        // Outermost: a refused source should not reach routing, auth, or the
+        // rate pool at all.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            source_allowlist,
+        ))
         .with_state(state);
 
     // Loopback by default. This process holds every provider key in the pool and
@@ -332,8 +378,11 @@ pub async fn run() {
         .await
         .expect("bind listener");
     println!("sluice v{} listening on {addr}", env!("CARGO_PKG_VERSION"));
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .expect("server");
 }
