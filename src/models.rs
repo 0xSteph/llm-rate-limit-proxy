@@ -22,6 +22,34 @@ struct Entry {
     models: Vec<Value>,
 }
 
+/// Context ceilings, learned from providers rather than configured.
+///
+/// The OpenAI catalog format has no field for a context window, so every client
+/// downstream of us is guessing at one — and a guess that is too high does not
+/// fail at startup, it fails deep into a long session. Providers state the real
+/// figure only when refusing a request that exceeded it, so that refusal is the
+/// one moment the number is knowable. Recording it there lets the catalog answer
+/// the question from then on.
+#[derive(Default)]
+pub struct Limits(Mutex<HashMap<String, u64>>);
+
+impl Limits {
+    /// Record a ceiling observed for `model`, keeping the smallest seen.
+    ///
+    /// Smallest rather than latest because keys can land on differently
+    /// configured deployments of the same model; publishing the roomier one
+    /// would hand clients a number that fails against the tighter one.
+    pub fn learn(&self, model: &str, tokens: u64) {
+        let mut m = self.0.lock().unwrap();
+        let slot = m.entry(model.to_string()).or_insert(tokens);
+        *slot = (*slot).min(tokens);
+    }
+
+    pub fn known(&self, model: &str) -> Option<u64> {
+        self.0.lock().unwrap().get(model).copied()
+    }
+}
+
 pub struct Catalog {
     /// Atomic so a settings change takes effect on the next lookup rather than
     /// at the next restart — the console offers this as a live setting.
@@ -106,18 +134,34 @@ pub fn extract(body: &Value) -> Vec<Value> {
 /// Ids are deduped: the same model offered by two providers is one entry, since
 /// a client picks a name and Sluice decides where it runs. First occurrence
 /// wins, so provider order in config decides which metadata is shown.
-pub fn merge(catalogs: &[Vec<Value>], aliases: &[Alias]) -> Value {
+pub fn merge(catalogs: &[Vec<Value>], aliases: &[Alias], limits: &Limits) -> Value {
     let mut seen: Vec<String> = Vec::new();
     let mut data: Vec<Value> = Vec::new();
+
+    // Publish a learned ceiling under both spellings in circulation: vLLM calls
+    // it `max_model_len`, OpenRouter calls it `context_length`, and a harness
+    // reads whichever one it was written against. Silence for models we have
+    // never seen refuse a request — an absent field makes a client fall back to
+    // its own default, while a wrong field makes it confidently overflow.
+    let annotate = |mut entry: Value, id: &str| -> Value {
+        if let (Some(n), Some(obj)) = (limits.known(id), entry.as_object_mut()) {
+            obj.insert("context_length".into(), json!(n));
+            obj.insert("max_model_len".into(), json!(n));
+        }
+        entry
+    };
 
     for name in aliases.iter().map(|a| &a.name) {
         if !seen.iter().any(|s| s == name) {
             seen.push(name.clone());
-            data.push(json!({
-                "id": name,
-                "object": "model",
-                "owned_by": "sluice",
-            }));
+            data.push(annotate(
+                json!({
+                    "id": name,
+                    "object": "model",
+                    "owned_by": "sluice",
+                }),
+                name,
+            ));
         }
     }
 
@@ -129,7 +173,8 @@ pub fn merge(catalogs: &[Vec<Value>], aliases: &[Alias]) -> Value {
             continue;
         }
         seen.push(id.to_string());
-        data.push(entry.clone());
+        let id = id.to_string();
+        data.push(annotate(entry.clone(), &id));
     }
 
     json!({ "object": "list", "data": data })
@@ -165,14 +210,52 @@ mod tests {
 
     #[test]
     fn merges_every_providers_catalog() {
-        let merged = merge(&[vec![model("a")], vec![model("b")]], &[]);
+        let merged = merge(
+            &[vec![model("a")], vec![model("b")]],
+            &[],
+            &Limits::default(),
+        );
         assert_eq!(ids(&merged), vec!["a", "b"]);
         assert_eq!(merged["object"], "list");
     }
 
     #[test]
+    fn a_learned_context_ceiling_is_published_to_clients() {
+        let limits = Limits::default();
+        limits.learn("glm", 202_752);
+
+        let merged = merge(&[vec![model("glm"), model("other")]], &[], &limits);
+        let glm = &merged["data"][0];
+
+        // Two spellings because clients disagree: vLLM publishes `max_model_len`,
+        // OpenRouter publishes `context_length`, and a harness reads whichever it
+        // was written against. Both name the same learned number.
+        assert_eq!(glm["context_length"], 202_752, "OpenRouter spelling");
+        assert_eq!(glm["max_model_len"], 202_752, "vLLM spelling");
+
+        // A model we have never overflowed must claim nothing rather than guess.
+        assert!(merged["data"][1].get("context_length").is_none());
+    }
+
+    #[test]
+    fn the_smallest_observed_ceiling_wins() {
+        // Different keys can land on differently-configured deployments of the
+        // same model. Publishing the larger one would hand clients a number that
+        // fails on some requests, so keep the one that is safe everywhere.
+        let limits = Limits::default();
+        limits.learn("m", 202_752);
+        limits.learn("m", 131_072);
+        limits.learn("m", 202_752);
+        assert_eq!(limits.known("m"), Some(131_072));
+    }
+
+    #[test]
     fn a_model_offered_by_two_providers_appears_once() {
-        let merged = merge(&[vec![model("same")], vec![model("same")]], &[]);
+        let merged = merge(
+            &[vec![model("same")], vec![model("same")]],
+            &[],
+            &Limits::default(),
+        );
         assert_eq!(ids(&merged), vec!["same"]);
     }
 
@@ -180,13 +263,21 @@ mod tests {
     /// lists models and never sees them cannot offer them to the user at all.
     #[test]
     fn aliases_are_listed_as_models() {
-        let merged = merge(&[vec![model("real")]], &[alias("virtual")]);
+        let merged = merge(
+            &[vec![model("real")]],
+            &[alias("virtual")],
+            &Limits::default(),
+        );
         assert_eq!(ids(&merged), vec!["virtual", "real"]);
     }
 
     #[test]
     fn an_alias_shadowing_a_real_model_is_not_duplicated() {
-        let merged = merge(&[vec![model("shared")]], &[alias("shared")]);
+        let merged = merge(
+            &[vec![model("shared")]],
+            &[alias("shared")],
+            &Limits::default(),
+        );
         assert_eq!(ids(&merged), vec!["shared"]);
         assert_eq!(
             merged["data"][0]["owned_by"], "sluice",
@@ -196,7 +287,11 @@ mod tests {
 
     #[test]
     fn entries_without_an_id_are_skipped() {
-        let merged = merge(&[vec![json!({"object": "model"}), model("ok")]], &[]);
+        let merged = merge(
+            &[vec![json!({"object": "model"}), model("ok")]],
+            &[],
+            &Limits::default(),
+        );
         assert_eq!(ids(&merged), vec!["ok"]);
     }
 

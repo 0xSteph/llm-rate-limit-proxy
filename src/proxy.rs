@@ -417,7 +417,7 @@ async fn serve_catalog(
         }
     }
 
-    Json(models::merge(&catalogs, aliases)).into_response()
+    Json(models::merge(&catalogs, aliases, &state.context_limits)).into_response()
 }
 
 /// Fetch one provider's catalog. Takes a rate slot like any other upstream call
@@ -740,6 +740,21 @@ pub async fn handle(
     )
 }
 
+/// Learn a model's context ceiling from the provider's own complaint about it.
+///
+/// Nothing in the OpenAI protocol publishes a context window — `/v1/models`
+/// carries no such field — so every client is left to guess, and a guess that is
+/// too high fails deep into a long session rather than at configuration time.
+/// The providers do know the number, but only say it in the error you get for
+/// exceeding it. Capturing it there turns a single overflow into a fact the
+/// catalog can hand to every client afterwards.
+fn parse_context_limit(body: &str) -> Option<u64> {
+    const MARKER: &str = "maximum context length is ";
+    let rest = &body[body.find(MARKER)? + MARKER.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 /// Did upstream answer `200 OK` with a completion containing nothing?
 ///
 /// NVIDIA does exactly this when a request's input plus its `max_tokens` exceeds
@@ -775,6 +790,16 @@ async fn relay(
     }
     let payload = upstream.bytes().await.unwrap_or_default();
     let gen_ms = gen_start.elapsed().as_millis() as u64;
+    // A refusal for being too long is the only place the real context window is
+    // ever stated. Catch it in passing so the catalog can publish it afterwards.
+    if !status.is_success() {
+        if let Some(n) = std::str::from_utf8(&payload)
+            .ok()
+            .and_then(parse_context_limit)
+        {
+            state.context_limits.learn(model, n);
+        }
+    }
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&payload) {
         if status.is_success() && is_empty_completion(&v) {
             return err(
@@ -1221,6 +1246,25 @@ mod tests {
             r#"{"object":"chat.completion.chunk","choices":[]}"#
         )));
         assert!(!is_empty_completion(&json(r#"{"data":[{"id":"m"}]}"#)));
+    }
+
+    #[test]
+    fn a_context_ceiling_is_learned_from_the_providers_complaint() {
+        // The exact body NVIDIA returns, captured from a real overflow.
+        let nvidia = r#"{"message":"This model's maximum context length is 202752 tokens. However, your messages resulted in 249928 tokens. Please reduce the length of the messages.","type":"Bad Request","code":400}"#;
+        assert_eq!(parse_context_limit(nvidia), Some(202_752));
+
+        // OpenAI phrases the same complaint with a comma and lowercase however.
+        let openai = "This model's maximum context length is 8192 tokens, however you requested 9000 tokens.";
+        assert_eq!(parse_context_limit(openai), Some(8192));
+
+        // Anything else must teach us nothing rather than a wrong number.
+        assert_eq!(
+            parse_context_limit(r#"{"message":"invalid api key"}"#),
+            None
+        );
+        assert_eq!(parse_context_limit("maximum context length is soon"), None);
+        assert_eq!(parse_context_limit(""), None);
     }
 
     #[test]

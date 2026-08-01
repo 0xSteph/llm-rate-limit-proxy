@@ -48,6 +48,9 @@ pub struct AppState {
     pub governor: Arc<governor::Governor>,
     /// Cached per-provider model catalogs behind the merged `/v1/models`.
     pub catalog: Arc<models::Catalog>,
+    /// Context windows learned from providers refusing over-long requests, then
+    /// published in `/v1/models` so clients stop having to guess.
+    pub context_limits: models::Limits,
     /// Models observed to reject `stream_options`, so we stop adding it for them.
     pub no_inject: Mutex<std::collections::HashSet<String>>,
     /// Content-blind request metrics (counts by client/model/status).
@@ -283,6 +286,7 @@ pub async fn run() {
         inflight: Arc::new(AtomicUsize::new(0)),
         governor: Arc::new(governor::Governor::default()),
         catalog: Arc::new(models::Catalog::new(Duration::from_secs(models_ttl))),
+        context_limits: models::Limits::default(),
         no_inject: Mutex::new(std::collections::HashSet::new()),
         pool,
         http,
