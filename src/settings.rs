@@ -530,6 +530,8 @@ pub struct LimitsReq {
     pub max_inflight: Option<usize>,
     pub models_ttl_secs: Option<u64>,
     pub history_days: Option<u32>,
+    /// Source addresses permitted to reach the proxy. Empty allows everyone.
+    pub allow_from: Option<Vec<String>>,
 }
 
 /// Update operational limits.
@@ -555,6 +557,17 @@ pub async fn limits(State(state): State<Arc<AppState>>, Json(req): Json<LimitsRe
         if let Some(v) = req.history_days {
             store.settings.history_days = v;
             state.history.set_retention_days(v);
+        }
+        if let Some(list) = req.allow_from {
+            // Reject a rule that cannot be parsed rather than dropping it. A
+            // silently discarded entry leaves the operator believing they are
+            // filtered when they are not, which is worse than an error.
+            for r in &list {
+                if crate::net::parse_rule(r).is_none() {
+                    return bad_request(&format!("'{r}' is not an address or CIDR block"));
+                }
+            }
+            store.settings.allow_from = list;
         }
         store.clone()
     };

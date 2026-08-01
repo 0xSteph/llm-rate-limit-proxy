@@ -1593,3 +1593,38 @@ async fn health_stays_reachable_regardless_of_the_allowlist() {
     assert_eq!(r.status(), 200);
     assert_eq!(s.get("/health").await.status(), 200);
 }
+
+/// A rule that cannot be parsed must be refused, not dropped. Silently
+/// discarding one leaves the operator believing they are filtered when they are
+/// not — the worst possible outcome for a security control.
+#[tokio::test]
+async fn an_unparseable_allow_rule_is_refused() {
+    let mock = support::start_mock_upstream().await;
+    let s = Server::start().await;
+    s.complete_wizard("admin", "password123", "mock", &mock, "k1")
+        .await;
+    s.login("admin", "password123").await;
+
+    let bad = settings_post(
+        &s,
+        "/api/settings/limits",
+        serde_json::json!({"allow_from": ["192.168.1.239", "not-an-address"]}),
+    )
+    .await;
+    assert_eq!(bad.status(), 400);
+
+    let good = settings_post(
+        &s,
+        "/api/settings/limits",
+        serde_json::json!({"allow_from": ["192.168.1.239", "100.64.0.0/10"]}),
+    )
+    .await;
+    assert_eq!(good.status(), 200);
+
+    let view: serde_json::Value = s.get("/api/settings").await.json().await.unwrap();
+    assert_eq!(
+        view["settings"]["allow_from"],
+        serde_json::json!(["192.168.1.239", "100.64.0.0/10"]),
+        "the good list must have been stored, and the bad one must not"
+    );
+}
