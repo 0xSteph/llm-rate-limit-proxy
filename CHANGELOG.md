@@ -6,19 +6,6 @@ Notable changes, newest first. Versions follow [semver](https://semver.org).
 
 First public release.
 
-### Renamed
-
-- The project is now `llm-rate-limit-proxy`, previously `sluice`. This changes
-  the binary, the crate, the systemd unit, the data directory, environment
-  variables, Prometheus metric names, the session cookie, the deadline header,
-  and the client key prefix.
-
-  Upgrading from a `sluice` install is a manual step: copy
-  `/var/lib/sluice/config.json` to `/var/lib/llm-rate-limit-proxy/config.json`,
-  then re-run the installer. Client keys minted before the rename keep working —
-  only the prefix on newly minted keys changes. Prometheus dashboards and alert
-  rules need `sluice_*` renamed to `llm_rate_limit_proxy_*`.
-
 ### Added
 
 - **Anthropic protocol support.** A provider now declares whether it speaks
@@ -41,6 +28,8 @@ First public release.
 - Context windows learned from providers that refuse over-long requests, then
   published through `/v1/models` and `/v1/props` so clients stop guessing
 - Source-address allowlist, managed through the settings API
+- One-line installer: checksum-verified binary and a hardened systemd unit
+- Container images on GHCR, and a native Windows binary on each release
 - `CONTRIBUTING.md` and `SECURITY.md`
 
 ### Fixed
@@ -49,13 +38,3 @@ First public release.
   rather than passed through as a success
 - Generation time is measured across the whole buffered exchange
 - `529` and `408` are retried; queue wait is recorded for streaming requests
-
-## 0.1.1
-
-- Native Windows binary published on each release
-- One-line installer with checksum verification and a hardened systemd unit
-- Container images published to GHCR on every push and tag
-
-## 0.1.0
-
-Initial tagged release.
