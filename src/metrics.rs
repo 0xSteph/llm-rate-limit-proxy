@@ -401,10 +401,13 @@ impl Metrics {
                 let (tools, reasoning) = extras.get(model).copied().unwrap_or((0, 0));
                 // Truncation rate is the actionable one: a model that keeps
                 // stopping at the output cap is being cut off, not failing.
-                let truncated = finish
-                    .get(&(model.clone(), "length".to_string()))
-                    .copied()
-                    .unwrap_or(0);
+                // The two protocols name the same event differently: OpenAI
+                // says `length`, Anthropic says `max_tokens`. Counting only one
+                // makes truncation invisible for half the traffic.
+                let truncated = ["length", "max_tokens"]
+                    .iter()
+                    .filter_map(|r| finish.get(&(model.clone(), (*r).to_string())))
+                    .sum();
                 ModelStat {
                     model: model.clone(),
                     requests,

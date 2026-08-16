@@ -2,10 +2,13 @@
 
 **Your coding agent never sees a rate limit again.**
 
-Point Cline, Aider or any OpenAI-compatible harness at one endpoint with one key.
-It pools every API key you own across every provider you use, paces each request
-inside that key's real limit, and fails over when a key or a provider misbehaves
-— so the 429 that used to kill your agent mid-task never reaches it.
+Point Claude Code, Cline, Aider or any OpenAI-compatible harness at one endpoint
+with one key. It pools every API key you own across every provider you use, paces
+each request inside that key's real limit, and fails over when a key or a provider
+misbehaves — so the 429 that used to kill your agent mid-task never reaches it.
+
+Speaks both the **OpenAI** (`/v1/chat/completions`) and **Anthropic**
+(`/v1/messages`) protocols, so Anthropic-native clients work without a shim.
 
 Rust · single 4 MB binary · self-hosted · your keys never leave your machine.
 
@@ -43,6 +46,7 @@ Then point your harness at it:
 
 | Harness | Setting |
 |---|---|
+| **Claude Code** | `ANTHROPIC_BASE_URL=http://localhost:8000` and `ANTHROPIC_API_KEY=lrlp_...` — needs a provider configured with the `anthropic` protocol |
 | **Cline / Roo Code** | Provider: *OpenAI Compatible* · Base URL `http://localhost:8000/v1` |
 | **Aider** | `aider --openai-api-base http://localhost:8000/v1 --openai-api-key lrlp_...` |
 | **Continue** | `"apiBase": "http://localhost:8000/v1"` on an `openai` provider |
@@ -56,9 +60,24 @@ export OPENAI_API_KEY=lrlp_your_client_key
 
 Re-run the installer to upgrade; your keys and settings are untouched.
 
-> This proxy speaks the **OpenAI-compatible** API (`/v1/chat/completions`, `Bearer`
-> auth). Claude Code and other Anthropic-protocol clients are not supported yet —
-> see [Roadmap](#roadmap).
+### Two protocols, one endpoint
+
+Each provider declares which wire protocol it speaks, picked in the setup wizard
+or when you add it later:
+
+| Protocol | Client sends | Upstream gets | Client auth |
+|---|---|---|---|
+| `openai` | `POST /v1/chat/completions` | `Authorization: Bearer` | `Authorization: Bearer` |
+| `anthropic` | `POST /v1/messages` | `x-api-key` + `anthropic-version` | `x-api-key` |
+
+Bodies are forwarded unchanged — this paces and pools, it does not translate
+between protocols. A request is therefore only routed to a provider speaking its
+own shape, and one with no matching provider is refused rather than sent
+somewhere that cannot parse it.
+
+Both can run at once behind the same endpoint and the same client key: Claude
+Code on `/v1/messages` and Aider on `/v1/chat/completions`, each paced against
+its own pool, with `/v1/models` merging both catalogs.
 
 ## How it works
 
@@ -150,7 +169,8 @@ rate limits, with the correctness of the pacing treated as the feature.
 | | llm-rate-limit-proxy | LiteLLM Proxy | LimitRateAPI |
 |---|---|---|---|
 | Runtime | One 4 MB static binary | Python + dependency tree | Python + FastAPI |
-| Providers | Any OpenAI-compatible endpoint | 100+, with protocol translation | Any OpenAI-compatible endpoint |
+| Claude Code | Works — native `/v1/messages` | Works — via translation | — |
+| Protocols | OpenAI **and** Anthropic, forwarded natively | 100+, via translation | OpenAI-compatible only |
 | On hitting a limit | Queues and paces; client never sees `429` | Retries and fallbacks | Queues and paces |
 | Streaming under queue | Held open with SSE heartbeats | Client waits on the request | SSE forwarded |
 | Multiple keys per provider | One lane per key, least-loaded routing | Yes | Single upstream key |
@@ -302,8 +322,6 @@ cargo test --test load -- --ignored   # 100 concurrent clients, asserts zero
 
 ## Roadmap
 
-- **Anthropic protocol support** (`/v1/messages`, `x-api-key`) so Claude Code
-  and other Anthropic-native clients can sit behind it
 - Per-client budgets and quotas
 - Settings forms for the remaining routes — the API is complete, the console
   covers most of it

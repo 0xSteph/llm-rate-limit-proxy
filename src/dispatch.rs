@@ -5,6 +5,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::config::Protocol;
 use crate::pool::PoolHandle;
 
 /// A granted rate slot: which lane won, and where to send the request.
@@ -13,6 +14,7 @@ pub struct Permit {
     pub provider: String,
     pub base_url: String,
     pub key: String,
+    pub protocol: Protocol,
 }
 
 pub struct Dispatcher {
@@ -32,7 +34,7 @@ impl Dispatcher {
     /// Acquire any rate slot, blocking until one is available. Convenience for
     /// callers that don't care which provider or lane serves them.
     pub async fn acquire(&self) -> Permit {
-        self.acquire_for(None, &[], None)
+        self.acquire_for(None, &[], None, None)
             .await
             .expect("acquire on a non-empty pool")
     }
@@ -46,6 +48,7 @@ impl Dispatcher {
         provider: Option<&str>,
         exclude: &[usize],
         session: Option<u64>,
+        protocol: Option<Protocol>,
     ) -> Option<Permit> {
         let _fifo = self.gate.lock().await;
         loop {
@@ -56,7 +59,13 @@ impl Dispatcher {
             // (spent budget, lane index) for every eligible lane with room left.
             let mut with_room: Vec<(usize, usize)> = Vec::new();
             for (idx, lane) in pool.lanes().iter().enumerate() {
-                if provider.is_some_and(|p| lane.provider != p) || exclude.contains(&idx) {
+                // Protocol is a hard filter, not a preference: this proxy forwards
+                // bodies unchanged, so an Anthropic-shaped request sent to an
+                // OpenAI upstream earns a 400 no matter which key serves it.
+                if provider.is_some_and(|p| lane.provider != p)
+                    || protocol.is_some_and(|w| lane.protocol != w)
+                    || exclude.contains(&idx)
+                {
                     continue;
                 }
                 eligible = true;
@@ -90,6 +99,7 @@ impl Dispatcher {
                         provider: lane.provider.clone(),
                         base_url: lane.base_url.clone(),
                         key: lane.key.clone(),
+                        protocol: lane.protocol,
                     });
                 }
             }
@@ -117,6 +127,7 @@ mod tests {
             base_url: format!("http://{name}.test"),
             key: format!("{name}-key"),
             rpm,
+            protocol: Default::default(),
         }
     }
 
@@ -146,11 +157,11 @@ mod tests {
         let pool = Pool::with_window(vec![spec("a", 2), spec("b", 2)], Duration::from_secs(60));
         let d = Dispatcher::new(handle(pool));
         let s = Some(0xBEEFu64);
-        let first = d.acquire_for(None, &[], s).await.unwrap().lane_idx;
-        let second = d.acquire_for(None, &[], s).await.unwrap().lane_idx;
+        let first = d.acquire_for(None, &[], s, None).await.unwrap().lane_idx;
+        let second = d.acquire_for(None, &[], s, None).await.unwrap().lane_idx;
         assert_eq!(first, second, "a session should stay on its own lane");
         // That lane is now at its rpm of 2, so the third has to spill.
-        let third = d.acquire_for(None, &[], s).await.unwrap().lane_idx;
+        let third = d.acquire_for(None, &[], s, None).await.unwrap().lane_idx;
         assert_ne!(third, first, "a full affinity lane must spill, not block");
     }
 

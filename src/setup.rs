@@ -25,6 +25,10 @@ const SETUP_HTML: &str = r#"<!doctype html><meta charset=utf-8>
   <p><input name=provider_name placeholder="Provider name (e.g. nim)"></p>
   <p><input name=base_url placeholder="Provider base URL"></p>
   <p><input name=api_key placeholder="Provider API key"></p>
+  <p><select name=protocol>
+    <option value=openai>OpenAI-compatible &mdash; /v1/chat/completions</option>
+    <option value=anthropic>Anthropic &mdash; /v1/messages</option>
+  </select></p>
   <p><button type=submit>Finish setup</button></p>
 </form>"#;
 
@@ -46,6 +50,10 @@ pub struct SetupForm {
     provider_name: String,
     base_url: String,
     api_key: String,
+    /// Absent for an OpenAI-compatible upstream, which is the common case and
+    /// what the wizard's form posts when the field is left alone.
+    #[serde(default)]
+    protocol: Option<config::Protocol>,
 }
 
 pub async fn setup_submit(
@@ -80,6 +88,7 @@ pub async fn setup_submit(
         store.providers.push(config::Provider {
             name: form.provider_name.clone(),
             base_url: config::normalize_base_url(&form.base_url),
+            protocol: form.protocol.unwrap_or_default(),
             keys: vec![config::ProviderKey {
                 key: form.api_key.clone(),
                 enabled: true,

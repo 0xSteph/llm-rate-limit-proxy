@@ -14,7 +14,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use crate::config::Alias;
+use crate::config::{Alias, Protocol};
 use crate::dispatch::Permit;
 use crate::{auth, governor, models, AppState};
 
@@ -126,6 +126,11 @@ fn normalize_path(path_query: &str) -> String {
     }
     out
 }
+
+/// The Anthropic API version to send when a client did not pick one. Pinned
+/// rather than tracking latest: the version decides the response shape, and
+/// silently moving it would change what clients receive without them asking.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Longest we honor a provider's `Retry-After`. Beyond this the value is more
 /// likely wrong than real, and obeying it would park a paid key for no reason.
@@ -377,8 +382,24 @@ fn build_request(
     for (n, v) in fwd_headers {
         rb = rb.header(n, v);
     }
-    rb.header("authorization", format!("Bearer {}", permit.key))
-        .body(body)
+    match permit.protocol {
+        Protocol::OpenAi => rb.header("authorization", format!("Bearer {}", permit.key)),
+        // Anthropic authenticates with `x-api-key` and requires a version on every
+        // request. A client that sent its own version keeps it: that header pins
+        // the response shape it is prepared to parse, which is its call, not ours.
+        Protocol::Anthropic => {
+            let rb = rb.header("x-api-key", permit.key.as_str());
+            if fwd_headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("anthropic-version"))
+            {
+                rb
+            } else {
+                rb.header("anthropic-version", ANTHROPIC_VERSION)
+            }
+        }
+    }
+    .body(body)
 }
 
 // --- Model catalog -----------------------------------------------------------
@@ -429,16 +450,17 @@ async fn fetch_catalog(
 ) -> Option<Vec<serde_json::Value>> {
     let permit = with_deadline(
         deadline,
-        state.dispatch.acquire_for(Some(provider), &[], None),
+        state.dispatch.acquire_for(Some(provider), &[], None, None),
     )
     .await??;
-    let resp = state
-        .http
-        .get(format!("{}/v1/models", permit.base_url))
-        .header("authorization", format!("Bearer {}", permit.key))
-        .send()
-        .await
-        .ok()?;
+    let rb = state.http.get(format!("{}/v1/models", permit.base_url));
+    let rb = match permit.protocol {
+        Protocol::OpenAi => rb.header("authorization", format!("Bearer {}", permit.key)),
+        Protocol::Anthropic => rb
+            .header("x-api-key", permit.key.as_str())
+            .header("anthropic-version", ANTHROPIC_VERSION),
+    };
+    let resp = rb.send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -472,10 +494,14 @@ pub async fn handle(
     // Keyed auth: a valid client key must be presented. Its label is the metrics
     // dimension for "who" — trusted (admin-set), never the secret.
     let clients = { state.store.lock().unwrap().clients.clone() };
+    // Anthropic-native clients send `x-api-key`; the OpenAI world sends
+    // `Authorization: Bearer`. Accept either, so a client authenticates the way
+    // its own protocol says to rather than the way this proxy would prefer.
     let client = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .and_then(|k| auth::verify_client_key(k, &clients));
     let Some(client) = client else {
         state.metrics.record_event("unauthorized");
@@ -511,7 +537,9 @@ pub async fn handle(
     let fwd_headers: Vec<(String, String)> = headers
         .iter()
         .filter(|(n, _)| {
-            !n.as_str().eq_ignore_ascii_case("authorization") && !is_hop_by_hop(n.as_str())
+            !n.as_str().eq_ignore_ascii_case("authorization")
+                && !n.as_str().eq_ignore_ascii_case("x-api-key")
+                && !is_hop_by_hop(n.as_str())
         })
         .filter_map(|(n, v)| {
             v.to_str()
@@ -529,6 +557,10 @@ pub async fn handle(
     // doubled prefix asks for its catalog down the same wrong path as everything
     // else, and routing decisions must see what forwarding will see.
     let route = path_query.split('?').next().unwrap_or_default();
+    // Which shape the client is speaking. Decided by route because that is the
+    // only thing true before the body is parsed, and it has to hold for bodies
+    // that are not JSON at all.
+    let wire = Protocol::of_route(route);
     if method == Method::GET && route == "/v1/models" {
         return serve_catalog(&state, &aliases, deadline).await;
     }
@@ -598,9 +630,14 @@ pub async fn handle(
     if streaming {
         // Ask for exact token counts unless this model has already told us it
         // rejects the field; keep the original so that can be undone per request.
-        let injected = (!state.no_inject.lock().unwrap().contains(&model_label))
-            .then(|| parsed.as_ref().and_then(inject_usage))
-            .flatten();
+        // OpenAI only. Anthropic reports usage in `message_start` and
+        // `message_delta` without being asked, and rejects unknown top-level
+        // fields — so adding `stream_options` there turns a good request into a
+        // 400.
+        let injected = (wire == Protocol::OpenAi
+            && !state.no_inject.lock().unwrap().contains(&model_label))
+        .then(|| parsed.as_ref().and_then(inject_usage))
+        .flatten();
         let (out_body, fallback) = match injected {
             Some(with_usage) => (with_usage, Some(body.clone())),
             None => (body.clone(), None),
@@ -618,6 +655,7 @@ pub async fn handle(
             client,
             requested,
             session,
+            wire,
             inflight,
             tx,
         ));
@@ -650,7 +688,7 @@ pub async fn handle(
             deadline,
             state
                 .dispatch
-                .acquire_for(step.provider.as_deref(), &excluded, session),
+                .acquire_for(step.provider.as_deref(), &excluded, session, Some(wire)),
         )
         .await
         {
@@ -841,20 +879,37 @@ async fn relay(
     (status, out, payload).into_response()
 }
 
-/// Pull every measurement an OpenAI-shaped response carries about itself.
+/// Pull every measurement a response carries about itself, in either protocol.
 ///
 /// Content-blind throughout: counts, reasons and durations, never a byte of the
-/// message. `finish_reason` matters more than it looks — `length` means the
-/// answer was cut off at the output cap, which reads as a stupid model until you
-/// can see it was truncated.
+/// message. The stop reason matters more than it looks — `length`/`max_tokens`
+/// means the answer was cut off at the output cap, which reads as a stupid model
+/// until you can see it was truncated.
+///
+/// Called once per buffered response, and once per `data:` frame of a stream.
+/// Anthropic splits its accounting over two frames — `message_start` nests usage
+/// under `message`, `message_delta` nests the stop reason under `delta` — so both
+/// nestings are checked, or a streamed Anthropic request records its output and
+/// none of its input.
 fn harvest(metrics: &crate::metrics::Metrics, model: &str, gen_ms: u64, v: &serde_json::Value) {
-    if let Some(u) = v.get("usage") {
+    let nested_usage = v.get("message").and_then(|m| m.get("usage"));
+    if let Some(u) = v.get("usage").or(nested_usage) {
         let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-        let (p, c) = (n("prompt_tokens"), n("completion_tokens"));
+        // OpenAI names these prompt/completion; Anthropic names them
+        // input/output. Same two numbers, so read whichever is present rather
+        // than carrying the protocol down here.
+        let (p, c) = match (n("prompt_tokens"), n("completion_tokens")) {
+            (0, 0) => (n("input_tokens"), n("output_tokens")),
+            pair => pair,
+        };
         if p > 0 || c > 0 {
             metrics.record_tokens(model, p, c);
         }
-        metrics.record_speed(model, c, gen_ms);
+        // A frame that reports no output tokens says nothing about speed;
+        // recording it would average a real rate against a zero.
+        if c > 0 {
+            metrics.record_speed(model, c, gen_ms);
+        }
         let reasoning = u
             .get("completion_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
@@ -862,6 +917,25 @@ fn harvest(metrics: &crate::metrics::Metrics, model: &str, gen_ms: u64, v: &serd
             .unwrap_or(0);
         if reasoning > 0 {
             metrics.record_extras(model, 0, reasoning);
+        }
+    }
+    // Anthropic states how a generation ended at the top level when buffered, and
+    // inside `delta` when streamed. Tool calls are blocks within `content` rather
+    // than a field beside the message.
+    if let Some(reason) = v
+        .get("stop_reason")
+        .or_else(|| v.get("delta").and_then(|d| d.get("stop_reason")))
+        .and_then(|r| r.as_str())
+    {
+        metrics.record_finish(model, reason);
+    }
+    if let Some(blocks) = v.get("content").and_then(|c| c.as_array()) {
+        let calls = blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            .count() as u64;
+        if calls > 0 {
+            metrics.record_extras(model, calls, 0);
         }
     }
     if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
@@ -903,15 +977,19 @@ fn sse_error(code: &str) -> Result<Bytes, std::io::Error> {
 
 /// Acquire a slot for `provider` while emitting heartbeats so the committed stream
 /// stays alive. `Ok(None)` = no eligible lane; `Err(())` = deadline or client gone.
+#[allow(clippy::too_many_arguments)]
 async fn acquire_for_heartbeating(
     state: &Arc<AppState>,
     provider: Option<&str>,
     excluded: &[usize],
     session: Option<u64>,
+    wire: Protocol,
     deadline: Option<Instant>,
     tx: &Tx,
 ) -> Result<Option<Permit>, ()> {
-    let acq = state.dispatch.acquire_for(provider, excluded, session);
+    let acq = state
+        .dispatch
+        .acquire_for(provider, excluded, session, Some(wire));
     tokio::pin!(acq);
     loop {
         let beat = tokio::time::sleep(HEARTBEAT);
@@ -954,6 +1032,7 @@ async fn stream_proxy(
     client: String,
     requested: Option<String>,
     session: Option<u64>,
+    wire: Protocol,
     // Held for the life of the stream so `max_inflight` bounds live streams too,
     // not just the brief window before the response is committed.
     _inflight: InflightGuard,
@@ -989,6 +1068,7 @@ async fn stream_proxy(
             step.provider.as_deref(),
             &excluded,
             session,
+            wire,
             deadline,
             &tx,
         )

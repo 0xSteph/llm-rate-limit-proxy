@@ -510,3 +510,83 @@ fn free_port() -> u16 {
         .unwrap()
         .port()
 }
+
+/// An Anthropic-shaped upstream. Reports back which credential headers it was
+/// presented with and echoes the body it received, so a test can prove the proxy
+/// authenticated the Anthropic way and forwarded the request unaltered.
+pub async fn start_anthropic_mock() -> String {
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(
+            |headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
+                let h = |n: &str| {
+                    headers
+                        .get(n)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let sent: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 11, "output_tokens": 7},
+                        // Observation surface for the test, not part of the protocol.
+                        "saw_x_api_key": h("x-api-key"),
+                        "saw_authorization": h("authorization"),
+                        "saw_anthropic_version": h("anthropic-version"),
+                        "saw_body": sent,
+                    })
+                    .to_string(),
+                )
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// An Anthropic upstream that streams the real four-frame shape: input tokens
+/// nested under `message` in `message_start`, output tokens and the stop reason
+/// arriving later in `message_delta`.
+pub async fn start_anthropic_stream_mock() -> String {
+    let app = axum::Router::new().route(
+        "/{*rest}",
+        axum::routing::any(|| async {
+            let frames = concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"type\":\"message\",",
+                "\"role\":\"assistant\",\"model\":\"claude-test\",\"content\":[],",
+                "\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},",
+                "\"usage\":{\"output_tokens\":9}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            );
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                frames,
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://127.0.0.1:{port}")
+}

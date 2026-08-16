@@ -83,6 +83,41 @@ pub struct Provider {
     pub base_url: String,
     #[serde(default)]
     pub keys: Vec<ProviderKey>,
+    /// Which wire protocol this upstream speaks. Defaults to OpenAI so a store
+    /// written before this field existed loads unchanged.
+    #[serde(default)]
+    pub protocol: Protocol,
+}
+
+/// The request shape an upstream expects, and that a client sends.
+///
+/// This proxy paces and pools; it does not translate between protocols. A body
+/// in one shape is forwarded in that shape, so a request can only be served by a
+/// provider speaking the same one — which is why this is a routing input and not
+/// just an auth detail.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Protocol {
+    /// `POST /v1/chat/completions` with `Authorization: Bearer`.
+    // Spelled the way someone would type it, rather than the `open_ai` that
+    // deriving snake_case from the variant name would produce.
+    #[serde(rename = "openai")]
+    #[default]
+    OpenAi,
+    /// `POST /v1/messages` with `x-api-key` and `anthropic-version`.
+    #[serde(rename = "anthropic")]
+    Anthropic,
+}
+
+impl Protocol {
+    /// The protocol a client is speaking, inferred from the route it called.
+    /// Anthropic's surface is `/v1/messages`; everything else is OpenAI-shaped.
+    pub fn of_route(route: &str) -> Self {
+        if route == "/v1/messages" || route.starts_with("/v1/messages/") {
+            Protocol::Anthropic
+        } else {
+            Protocol::OpenAi
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -279,6 +314,7 @@ mod tests {
             providers: vec![Provider {
                 name: "nim".into(),
                 base_url: "https://example.test".into(),
+                protocol: Default::default(),
                 keys: vec![ProviderKey {
                     key: "k".into(),
                     enabled: true,

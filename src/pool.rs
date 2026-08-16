@@ -8,7 +8,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::config::StoredConfig;
+use crate::config::{Protocol, StoredConfig};
 
 /// A provider's real per-key rate window; requests are limited per this span.
 pub const PROVIDER_WINDOW: Duration = Duration::from_secs(60);
@@ -75,6 +75,7 @@ pub struct Lane {
     pub base_url: String,
     pub key: String,
     pub rpm: usize,
+    pub protocol: Protocol,
     limiter: Mutex<SlidingWindow>,
     cooldown_until: Mutex<Option<Instant>>,
 }
@@ -88,6 +89,7 @@ impl Lane {
             base_url: spec.base_url,
             key: spec.key,
             rpm: spec.rpm,
+            protocol: spec.protocol,
         }
     }
 
@@ -141,6 +143,7 @@ pub struct LaneSpec {
     pub base_url: String,
     pub key: String,
     pub rpm: usize,
+    pub protocol: Protocol,
 }
 
 /// Flatten every enabled, non-zero-rpm key across all providers into lane specs.
@@ -154,6 +157,7 @@ pub fn lane_specs(sc: &StoredConfig) -> Vec<LaneSpec> {
                     base_url: p.base_url.clone(),
                     key: k.key.clone(),
                     rpm: k.rpm,
+                    protocol: p.protocol,
                 });
             }
         }
@@ -301,6 +305,7 @@ mod tests {
         Provider {
             name: name.into(),
             base_url: format!("http://{name}.test"),
+            protocol: Default::default(),
             keys: vec![ProviderKey {
                 key: format!("{name}-key"),
                 enabled,
@@ -346,6 +351,7 @@ mod tests {
                 base_url: "http://nim.test".into(),
                 key: format!("key-{i}"),
                 rpm: 40,
+                protocol: Default::default(),
             })
             .collect()
     }

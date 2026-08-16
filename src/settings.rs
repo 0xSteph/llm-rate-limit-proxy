@@ -79,6 +79,7 @@ pub async fn view(
         "providers": store.providers.iter().map(|p| json!({
             "name": p.name,
             "base_url": p.base_url,
+            "protocol": p.protocol,
             "keys": p.keys.iter().map(|k| json!({
                 "last4": last4(&k.key),
                 "enabled": k.enabled,
@@ -219,6 +220,10 @@ pub enum ProviderAction {
         base_url: String,
         key: String,
         rpm: Option<usize>,
+        /// Which wire protocol this upstream speaks. Omitted means OpenAI, so
+        /// existing callers keep working unchanged.
+        #[serde(default)]
+        protocol: config::Protocol,
     },
     Remove {
         name: String,
@@ -246,6 +251,7 @@ pub async fn providers(
                 base_url,
                 key,
                 rpm,
+                protocol,
             } => {
                 let name = name.trim().to_string();
                 let key = key.trim().to_string();
@@ -269,6 +275,7 @@ pub async fn providers(
                 store.providers.push(config::Provider {
                     name,
                     base_url,
+                    protocol,
                     keys: vec![config::ProviderKey {
                         key,
                         enabled: true,

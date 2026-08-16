@@ -386,6 +386,10 @@
         <input name="name" placeholder="name" size="10" required>
         <input name="base_url" placeholder="https://host  (a trailing /v1 is trimmed)" size="34" required>
         <input name="key" placeholder="first api key" size="22" required>
+        <select name="protocol" title="the wire protocol this upstream speaks">
+          <option value="openai">openai</option>
+          <option value="anthropic">anthropic</option>
+        </select>
         <input name="rpm" type="number" value="40" min="1" max="10000" size="5" title="requests per minute">
         <button type="submit">add provider</button>
       </form>
@@ -748,10 +752,11 @@
 
     const provs = cfg2.providers || [];
     fill("cfg-providers", provs.length ? table(provs.map((p) => [
-      p.name, p.base_url, `${p.keys.length} key${p.keys.length === 1 ? "" : "s"}`,
+      p.name, p.base_url, p.protocol || "openai",
+      `${p.keys.length} key${p.keys.length === 1 ? "" : "s"}`,
       actionBtn("remove", true, () => act("/api/settings/providers",
         { action: "remove", name: p.name }, `provider ${p.name} removed`)),
-    ]), ["provider", "base url", "keys", ""]) : null, "no providers configured");
+    ]), ["provider", "base url", "protocol", "keys", ""]) : null, "no providers configured");
 
     const keyRows = [];
     for (const p of provs) {

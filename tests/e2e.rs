@@ -155,6 +155,7 @@ async fn fails_over_from_bad_key_to_good_key() {
         providers: vec![Provider {
             name: "mock".into(),
             base_url: mock.clone(),
+            protocol: Default::default(),
             keys: vec![
                 ProviderKey {
                     key: "bad-key".into(),
@@ -223,6 +224,7 @@ async fn a_conversation_keeps_one_key_as_its_transcript_grows() {
         providers: vec![Provider {
             name: "mock".into(),
             base_url: mock.clone(),
+            protocol: Default::default(),
             keys: (0..4)
                 .map(|i| ProviderKey {
                     key: format!("key-{i}"),
@@ -282,6 +284,7 @@ async fn a_rate_limited_key_is_benched_so_the_next_request_skips_it() {
         providers: vec![Provider {
             name: "mock".into(),
             base_url: mock.clone(),
+            protocol: Default::default(),
             keys: ["sick-key", "healthy-key"]
                 .iter()
                 .map(|k| ProviderKey {
@@ -338,6 +341,7 @@ async fn requests_past_the_concurrency_cap_are_shed_with_retry_after() {
         providers: vec![Provider {
             name: "mock".into(),
             base_url: mock.clone(),
+            protocol: Default::default(),
             keys: vec![ProviderKey {
                 key: "k".into(),
                 enabled: true,
@@ -408,6 +412,7 @@ async fn pressure_on_a_model_is_detected_across_keys_and_reported() {
         providers: vec![Provider {
             name: "mock".into(),
             base_url: mock.clone(),
+            protocol: Default::default(),
             keys: (0..4)
                 .map(|i| ProviderKey {
                     key: format!("key-{i}"),
@@ -465,6 +470,7 @@ async fn the_catalog_is_cached_and_lists_aliases_alongside_real_models() {
         providers: vec![Provider {
             name: "mock".into(),
             base_url: mock.clone(),
+            protocol: Default::default(),
             keys: vec![ProviderKey {
                 key: "k".into(),
                 enabled: true,
@@ -990,6 +996,7 @@ async fn virtual_model_falls_back_across_providers() {
             Provider {
                 name: "pa".into(),
                 base_url: mock_a,
+                protocol: Default::default(),
                 keys: vec![ProviderKey {
                     key: "pa-key".into(),
                     enabled: true,
@@ -1000,6 +1007,7 @@ async fn virtual_model_falls_back_across_providers() {
             Provider {
                 name: "pb".into(),
                 base_url: mock_b,
+                protocol: Default::default(),
                 keys: vec![ProviderKey {
                     key: "pb-key".into(),
                     enabled: true,
@@ -1555,6 +1563,7 @@ async fn a_source_allowlist_refuses_everyone_else_but_never_loopback() {
         providers: vec![Provider {
             name: "mock".into(),
             base_url: mock.clone(),
+            protocol: Default::default(),
             keys: vec![ProviderKey {
                 key: "k".into(),
                 enabled: true,
@@ -1641,5 +1650,370 @@ async fn an_unparseable_allow_rule_is_refused() {
         view["settings"]["allow_from"],
         serde_json::json!(["192.168.1.239", "100.64.0.0/10"]),
         "the good list must have been stored, and the bad one must not"
+    );
+}
+
+// --- Anthropic protocol ------------------------------------------------------
+
+/// Seed a store with one Anthropic provider and one OpenAI provider, and return
+/// the client secret alongside the server.
+async fn anthropic_and_openai(anthropic_url: &str, openai_url: &str) -> (Server, String) {
+    use llm_rate_limit_proxy::auth::{hash_password, new_client_key};
+    use llm_rate_limit_proxy::config::{
+        Protocol, Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION,
+    };
+
+    let (client_secret, client_rec) = new_client_key("test", "admin");
+    let key = |k: &str| ProviderKey {
+        key: k.into(),
+        enabled: true,
+        rpm: 40,
+        owner: "admin".into(),
+    };
+    let store = StoredConfig {
+        version: STORE_VERSION,
+        users: vec![User {
+            username: "admin".into(),
+            pw_hash: hash_password("password123"),
+            role: Role::Superuser,
+        }],
+        // OpenAI deliberately first. Lanes are chosen least-loaded with ties
+        // broken to the lower index, so on an idle pool lane 0 wins — which
+        // means an Anthropic request landing correctly proves the protocol
+        // filter did it, not the load balancer.
+        providers: vec![
+            Provider {
+                name: "openai".into(),
+                base_url: openai_url.to_string(),
+                protocol: Protocol::OpenAi,
+                keys: vec![key("sk-openai-secret")],
+            },
+            Provider {
+                name: "anthropic".into(),
+                base_url: anthropic_url.to_string(),
+                protocol: Protocol::Anthropic,
+                keys: vec![key("sk-ant-secret")],
+            },
+        ],
+        clients: vec![client_rec],
+        aliases: vec![],
+        settings: Default::default(),
+    };
+    (Server::start_seeded(&store, &[]).await, client_secret)
+}
+
+/// Claude Code authenticates with `x-api-key`, not `Authorization: Bearer`.
+/// Rejecting it was the single thing that kept every Anthropic-native client out.
+#[tokio::test]
+async fn an_anthropic_client_authenticates_with_x_api_key() {
+    let anthropic = support::start_anthropic_mock().await;
+    let openai = support::start_mock_upstream().await;
+    let (s, secret) = anthropic_and_openai(&anthropic, &openai).await;
+
+    let r = s
+        .client
+        .post(format!("{}/v1/messages", s.base_url))
+        .header("x-api-key", &secret)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-test","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "x-api-key was not accepted as client auth");
+
+    let wrong = s
+        .client
+        .post(format!("{}/v1/messages", s.base_url))
+        .header("x-api-key", "not-a-real-key")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401, "a bad x-api-key must still be refused");
+}
+
+/// Upstream auth follows the provider's protocol, and the client's own credential
+/// never travels with the request — the proxy holds the real keys precisely so
+/// the client never has to.
+#[tokio::test]
+async fn an_anthropic_upstream_gets_x_api_key_and_a_version_not_bearer() {
+    let anthropic = support::start_anthropic_mock().await;
+    let openai = support::start_mock_upstream().await;
+    let (s, secret) = anthropic_and_openai(&anthropic, &openai).await;
+
+    let body: serde_json::Value = s
+        .client
+        .post(format!("{}/v1/messages", s.base_url))
+        .header("x-api-key", &secret)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-test","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body["saw_x_api_key"], "sk-ant-secret",
+        "upstream should be presented the provider key via x-api-key"
+    );
+    assert_eq!(
+        body["saw_authorization"], "",
+        "an Anthropic upstream must not be sent a Bearer header"
+    );
+    assert_eq!(
+        body["saw_anthropic_version"], "2023-06-01",
+        "anthropic-version is required on every request"
+    );
+    assert_ne!(
+        body["saw_x_api_key"],
+        serde_json::json!(secret),
+        "the client's own key must never be forwarded upstream"
+    );
+}
+
+/// A client that pins its own API version keeps it: that header decides the
+/// response shape it is prepared to parse.
+#[tokio::test]
+async fn a_clients_own_anthropic_version_is_left_alone() {
+    let anthropic = support::start_anthropic_mock().await;
+    let openai = support::start_mock_upstream().await;
+    let (s, secret) = anthropic_and_openai(&anthropic, &openai).await;
+
+    let body: serde_json::Value = s
+        .client
+        .post(format!("{}/v1/messages", s.base_url))
+        .header("x-api-key", &secret)
+        .header("anthropic-version", "2024-10-22")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-test","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["saw_anthropic_version"], "2024-10-22");
+}
+
+/// The proxy forwards bodies rather than translating them, so a request can only
+/// be served by a provider speaking its shape. Sending an Anthropic body to an
+/// OpenAI upstream would earn a 400 no matter which key served it.
+#[tokio::test]
+async fn a_request_only_reaches_a_provider_speaking_its_protocol() {
+    let anthropic = support::start_anthropic_mock().await;
+    let openai = support::start_echo_mock().await;
+    let (s, secret) = anthropic_and_openai(&anthropic, &openai).await;
+
+    // Anthropic route -> the Anthropic mock, even though the OpenAI lane is
+    // lane 0 and would otherwise win the tie on an idle pool.
+    let a: serde_json::Value = s
+        .client
+        .post(format!("{}/v1/messages", s.base_url))
+        .header("x-api-key", &secret)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-test","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(a["type"], "message", "did not reach the Anthropic upstream");
+
+    // OpenAI route -> the echo mock, which returns exactly what it was sent and
+    // therefore carries none of the Anthropic mock's observation fields.
+    let o: serde_json::Value = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {secret}"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-x","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(o["model"], "gpt-x", "did not reach the OpenAI upstream");
+    assert!(
+        o.get("saw_x_api_key").is_none(),
+        "an OpenAI request was served by the Anthropic lane"
+    );
+}
+
+/// `stream_options` is an OpenAI field. Anthropic reports usage unasked and
+/// rejects unknown top-level fields, so injecting it there turns a good request
+/// into a 400.
+#[tokio::test]
+async fn stream_options_is_never_added_to_an_anthropic_body() {
+    let anthropic = support::start_anthropic_mock().await;
+    let openai = support::start_mock_upstream().await;
+    let (s, secret) = anthropic_and_openai(&anthropic, &openai).await;
+
+    let raw = s
+        .client
+        .post(format!("{}/v1/messages", s.base_url))
+        .header("x-api-key", &secret)
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"claude-test","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        !raw.contains("stream_options"),
+        "stream_options was injected into an Anthropic request: {raw}"
+    );
+}
+
+/// Anthropic names its token counts input/output rather than prompt/completion.
+/// Read the wrong pair and every Anthropic request records as zero tokens.
+#[tokio::test]
+async fn anthropic_token_counts_are_recorded() {
+    let anthropic = support::start_anthropic_mock().await;
+    let openai = support::start_mock_upstream().await;
+    let (s, secret) = anthropic_and_openai(&anthropic, &openai).await;
+
+    s.client
+        .post(format!("{}/v1/messages", s.base_url))
+        .header("x-api-key", &secret)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-test","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    s.login("admin", "password123").await;
+    let stats: serde_json::Value = s.get("/api/stats").await.json().await.unwrap();
+    let row = stats["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["model"] == "claude-test")
+        .expect("claude-test not in stats");
+    assert_eq!(row["prompt_tokens"], 11, "input_tokens not recorded");
+    assert_eq!(row["completion_tokens"], 7, "output_tokens not recorded");
+}
+
+/// With no provider speaking the client's protocol, the request must be refused
+/// rather than forwarded to an upstream that cannot parse it. Misrouting would
+/// surface as a confusing 400 from someone else's API.
+#[tokio::test]
+async fn an_anthropic_request_is_refused_when_no_anthropic_provider_exists() {
+    use llm_rate_limit_proxy::auth::{hash_password, new_client_key};
+    use llm_rate_limit_proxy::config::{
+        Protocol, Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION,
+    };
+
+    let openai = support::start_echo_mock().await;
+    let (client_secret, client_rec) = new_client_key("test", "admin");
+    let store = StoredConfig {
+        version: STORE_VERSION,
+        users: vec![User {
+            username: "admin".into(),
+            pw_hash: hash_password("password123"),
+            role: Role::Superuser,
+        }],
+        providers: vec![Provider {
+            name: "openai".into(),
+            base_url: openai.clone(),
+            protocol: Protocol::OpenAi,
+            keys: vec![ProviderKey {
+                key: "sk-openai-secret".into(),
+                enabled: true,
+                rpm: 40,
+                owner: "admin".into(),
+            }],
+        }],
+        clients: vec![client_rec],
+        aliases: vec![],
+        settings: Default::default(),
+    };
+    let s = Server::start_seeded(&store, &[]).await;
+
+    let r = s
+        .client
+        .post(format!("{}/v1/messages", s.base_url))
+        .header("x-api-key", &client_secret)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"claude-test","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        503,
+        "an Anthropic request was routed to an OpenAI-only pool"
+    );
+
+    // The same pool still serves OpenAI traffic normally.
+    let ok = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base_url))
+        .header("authorization", format!("Bearer {client_secret}"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-x","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+}
+
+/// Anthropic reports input tokens in `message_start` (nested under `message`) and
+/// output tokens plus the stop reason in `message_delta` (nested under `delta`).
+/// Reading only the top level of each frame records a stream's output and none of
+/// its input, and loses truncation entirely.
+#[tokio::test]
+async fn a_streamed_anthropic_response_accounts_for_both_frames() {
+    let anthropic = support::start_anthropic_stream_mock().await;
+    let openai = support::start_mock_upstream().await;
+    let (s, secret) = anthropic_and_openai(&anthropic, &openai).await;
+
+    let body = s
+        .client
+        .post(format!("{}/v1/messages", s.base_url))
+        .header("x-api-key", &secret)
+        .header("content-type", "application/json")
+        .body(
+            r#"{"model":"claude-test","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("message_stop"),
+        "stream did not complete: {body}"
+    );
+
+    s.login("admin", "password123").await;
+    let stats: serde_json::Value = s.get("/api/stats").await.json().await.unwrap();
+    let row = stats["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["model"] == "claude-test")
+        .expect("claude-test not in stats");
+    assert_eq!(
+        row["prompt_tokens"], 42,
+        "input tokens from message_start were not recorded"
+    );
+    assert_eq!(
+        row["completion_tokens"], 9,
+        "output tokens from message_delta were not recorded"
+    );
+    assert_eq!(
+        row["truncated"], 1,
+        "max_tokens in message_delta was not recorded as truncation"
     );
 }
