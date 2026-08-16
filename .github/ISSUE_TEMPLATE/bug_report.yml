@@ -1,0 +1,45 @@
+name: Bug report
+description: Something behaved differently from how it is documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything security-sensitive, please use
+        [private vulnerability reporting](https://github.com/0xSteph/llm-rate-limit-proxy/security/advisories/new)
+        instead of a public issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The smallest sequence of steps that shows it.
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The version in the console header, or `git rev-parse --short HEAD`.
+    validations: { required: true }
+  - type: dropdown
+    id: install
+    attributes:
+      label: How it is installed
+      options: [installer script, container, binary from releases, from source]
+    validations: { required: true }
+  - type: input
+    id: provider
+    attributes:
+      label: Upstream provider
+      description: If it involves an upstream — the provider, and any status code it returned.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: "`journalctl -u llm-rate-limit-proxy -n 50`, or container logs. Redact your keys."
+      render: shell

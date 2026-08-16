@@ -1,7 +1,7 @@
 #!/bin/sh
-# Sluice installer.
+# LLM Rate Limit Proxy installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/0xSteph/sluice/master/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/0xSteph/llm-rate-limit-proxy/master/install.sh | sh
 #
 # Downloads the right binary for this machine, verifies it against the published
 # checksums, installs a hardened systemd service, and starts it. Re-running is
@@ -11,14 +11,14 @@
 # installed anything, which is the whole point of a one-line installer.
 set -eu
 
-REPO="${SLUICE_REPO:-0xSteph/sluice}"
-BIN_DIR="${SLUICE_BIN_DIR:-/usr/local/bin}"
-DATA_DIR="${SLUICE_DATA_DIR:-/var/lib/sluice}"
-SERVICE_USER="${SLUICE_USER:-sluice}"
-PORT="${SLUICE_PORT:-8000}"
+REPO="${LLM_RATE_LIMIT_PROXY_REPO:-0xSteph/llm-rate-limit-proxy}"
+BIN_DIR="${LLM_RATE_LIMIT_PROXY_BIN_DIR:-/usr/local/bin}"
+DATA_DIR="${LLM_RATE_LIMIT_PROXY_DATA_DIR:-/var/lib/llm-rate-limit-proxy}"
+SERVICE_USER="${LLM_RATE_LIMIT_PROXY_USER:-llm-rate-limit-proxy}"
+PORT="${LLM_RATE_LIMIT_PROXY_PORT:-8000}"
 # Loopback by default. This process holds every provider key you give it and
 # terminates no TLS, so exposing it has to be a deliberate act.
-HOST="${SLUICE_HOST:-127.0.0.1}"
+HOST="${LLM_RATE_LIMIT_PROXY_HOST:-127.0.0.1}"
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -26,7 +26,7 @@ die()  { printf '\n  \033[31m✗\033[0m %s\n\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "need '$1' and it isn't installed"; }
 
-printf '\n  Sluice installer\n\n'
+printf '\n  LLM Rate Limit Proxy installer\n\n'
 
 # --- what are we installing onto -------------------------------------------
 [ "$(uname -s)" = "Linux" ] || die "this installer is Linux-only; on macOS use Docker"
@@ -50,8 +50,8 @@ fi
 
 # --- private repos need a token, public ones don't --------------------------
 AUTH=""
-if [ -n "${SLUICE_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
-  AUTH="Authorization: Bearer ${SLUICE_TOKEN:-$GITHUB_TOKEN}"
+if [ -n "${LLM_RATE_LIMIT_PROXY_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+  AUTH="Authorization: Bearer ${LLM_RATE_LIMIT_PROXY_TOKEN:-$GITHUB_TOKEN}"
   ok "using a token for a private repository"
 fi
 
@@ -60,14 +60,14 @@ api() {
 }
 
 # --- find the newest release ------------------------------------------------
-VERSION="${SLUICE_VERSION:-}"
+VERSION="${LLM_RATE_LIMIT_PROXY_VERSION:-}"
 if [ -z "$VERSION" ]; then
   say "looking up the latest release..."
   VERSION=$(api "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
     | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1) || true
   [ -n "$VERSION" ] || die "no published release found.
      If the repository is private, set a token:
-       SLUICE_TOKEN=ghp_... curl -fsSL .../install.sh | sh
+       LLM_RATE_LIMIT_PROXY_TOKEN=ghp_... curl -fsSL .../install.sh | sh
      If nothing is released yet, cut one:
        git tag v0.1.0 && git push origin v0.1.0"
 fi
@@ -75,7 +75,7 @@ ok "installing $VERSION"
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT INT TERM
 V="${VERSION#v}"
-TARBALL="sluice-${V}-linux-${ARCH}.tar.gz"
+TARBALL="llm-rate-limit-proxy-${V}-linux-${ARCH}.tar.gz"
 
 # Private releases cannot be fetched from the browser URL, so go through the
 # API, which honours the token.
@@ -110,11 +110,11 @@ else
 fi
 
 tar -xzf "$TMP/$TARBALL" -C "$TMP"
-[ -f "$TMP/sluice-$ARCH" ] || die "archive did not contain the expected binary"
+[ -f "$TMP/llm-rate-limit-proxy-$ARCH" ] || die "archive did not contain the expected binary"
 
 # --- install -----------------------------------------------------------------
-$SUDO install -m 0755 "$TMP/sluice-$ARCH" "$BIN_DIR/sluice"
-ok "installed $BIN_DIR/sluice"
+$SUDO install -m 0755 "$TMP/llm-rate-limit-proxy-$ARCH" "$BIN_DIR/llm-rate-limit-proxy"
+ok "installed $BIN_DIR/llm-rate-limit-proxy"
 
 # An unprivileged service account with no shell and no home to log into.
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -130,9 +130,9 @@ ok "data directory $DATA_DIR"
 
 # --- service -----------------------------------------------------------------
 if command -v systemctl >/dev/null 2>&1; then
-  $SUDO tee /etc/systemd/system/sluice.service >/dev/null <<UNIT
+  $SUDO tee /etc/systemd/system/llm-rate-limit-proxy.service >/dev/null <<UNIT
 [Unit]
-Description=Sluice — rate-limit-aware LLM API proxy
+Description=LLM Rate Limit Proxy — rate-limit-aware LLM API proxy
 Documentation=https://github.com/$REPO
 After=network-online.target
 Wants=network-online.target
@@ -144,7 +144,7 @@ Group=$SERVICE_USER
 Environment=DATA_DIR=$DATA_DIR
 Environment=HOST=$HOST
 Environment=PORT=$PORT
-ExecStart=$BIN_DIR/sluice
+ExecStart=$BIN_DIR/llm-rate-limit-proxy
 Restart=on-failure
 RestartSec=3
 
@@ -168,7 +168,7 @@ CapabilityBoundingSet=
 WantedBy=multi-user.target
 UNIT
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now sluice >/dev/null 2>&1 || $SUDO systemctl restart sluice
+  $SUDO systemctl enable --now llm-rate-limit-proxy >/dev/null 2>&1 || $SUDO systemctl restart llm-rate-limit-proxy
   ok "service started and enabled at boot"
 
   # Wait for it to answer rather than claiming success and hoping.
@@ -180,7 +180,7 @@ UNIT
     fi
     i=$((i + 1)); sleep 0.5
   done
-  [ $i -lt 20 ] || die "installed, but it did not come up. Check: journalctl -u sluice -n 50"
+  [ $i -lt 20 ] || die "installed, but it did not come up. Check: journalctl -u llm-rate-limit-proxy -n 50"
   MANAGED=1
 else
   MANAGED=0
@@ -195,11 +195,11 @@ if [ "$MANAGED" = "1" ]; then
   Done. Open http://localhost:$PORT and finish the setup wizard —
   the first visitor becomes the admin, so do that now.
 
-    status    systemctl status sluice
-    logs      journalctl -u sluice -f
+    status    systemctl status llm-rate-limit-proxy
+    logs      journalctl -u llm-rate-limit-proxy -f
     upgrade   re-run this installer
-    remove    sudo systemctl disable --now sluice \
-                && sudo rm $BIN_DIR/sluice /etc/systemd/system/sluice.service
+    remove    sudo systemctl disable --now llm-rate-limit-proxy \
+                && sudo rm $BIN_DIR/llm-rate-limit-proxy /etc/systemd/system/llm-rate-limit-proxy.service
 
 DONE
 else
@@ -208,13 +208,13 @@ else
   Installed, but this system has no systemd, so nothing is running yet.
   Start it with:
 
-    sudo -u $SERVICE_USER DATA_DIR=$DATA_DIR HOST=$HOST PORT=$PORT $BIN_DIR/sluice
+    sudo -u $SERVICE_USER DATA_DIR=$DATA_DIR HOST=$HOST PORT=$PORT $BIN_DIR/llm-rate-limit-proxy
 
   Then open http://localhost:$PORT and finish the setup wizard —
   the first visitor becomes the admin.
 
     upgrade   re-run this installer
-    remove    sudo rm $BIN_DIR/sluice
+    remove    sudo rm $BIN_DIR/llm-rate-limit-proxy
 
 DONE
 fi

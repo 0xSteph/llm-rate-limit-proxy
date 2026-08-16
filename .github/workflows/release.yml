@@ -2,7 +2,7 @@ name: Release
 
 # Two cadences, deliberately different.
 #
-#   push to master  -> a rolling ghcr.io/OWNER/sluice:edge image
+#   push to master  -> a rolling ghcr.io/OWNER/llm-rate-limit-proxy:edge image
 #   push of a v* tag -> a versioned image plus binaries on a GitHub Release
 #
 # Cutting a release per commit would mean hundreds of versions and no way to say
@@ -90,11 +90,11 @@ jobs:
         run: |
           $v = "${{ github.ref_name }}" -replace '^v',''
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/sluice.exe dist/sluice.exe
-          Compress-Archive -Path dist/sluice.exe -DestinationPath "dist/sluice-$v-windows-amd64.zip"
-          Remove-Item dist/sluice.exe
-          (Get-FileHash "dist/sluice-$v-windows-amd64.zip" -Algorithm SHA256).Hash.ToLower() +
-            "  sluice-$v-windows-amd64.zip" | Out-File -Encoding ascii dist/SHA256SUMS.windows
+          Copy-Item target/release/llm-rate-limit-proxy.exe dist/llm-rate-limit-proxy.exe
+          Compress-Archive -Path dist/llm-rate-limit-proxy.exe -DestinationPath "dist/llm-rate-limit-proxy-$v-windows-amd64.zip"
+          Remove-Item dist/llm-rate-limit-proxy.exe
+          (Get-FileHash "dist/llm-rate-limit-proxy-$v-windows-amd64.zip" -Algorithm SHA256).Hash.ToLower() +
+            "  llm-rate-limit-proxy-$v-windows-amd64.zip" | Out-File -Encoding ascii dist/SHA256SUMS.windows
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows
@@ -128,10 +128,10 @@ jobs:
           mkdir -p dist
           for arch in amd64 arm64; do
             cid=$(docker create --platform "linux/${arch}" "$image")
-            docker cp "${cid}:/sluice" "dist/sluice-${arch}"
+            docker cp "${cid}:/llm-rate-limit-proxy" "dist/llm-rate-limit-proxy-${arch}"
             docker rm "$cid" >/dev/null
-            tar -czf "dist/sluice-${version}-linux-${arch}.tar.gz" -C dist "sluice-${arch}"
-            rm "dist/sluice-${arch}"
+            tar -czf "dist/llm-rate-limit-proxy-${version}-linux-${arch}.tar.gz" -C dist "llm-rate-limit-proxy-${arch}"
+            rm "dist/llm-rate-limit-proxy-${arch}"
           done
           # The Windows job computed its own hash on its own runner; fold it in
           # rather than recomputing, so one file covers every artifact.
@@ -144,15 +144,15 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "sluice $version" \
+            --title "llm-rate-limit-proxy $version" \
             --generate-notes \
             --notes "
           ## Install
 
           Container (recommended):
 
-              docker run -d --name sluice -p 127.0.0.1:8000:8000 \\
-                -v sluice-data:/data ghcr.io/${GITHUB_REPOSITORY,,}:${version}
+              docker run -d --name llm-rate-limit-proxy -p 127.0.0.1:8000:8000 \\
+                -v llm-rate-limit-proxy-data:/data ghcr.io/${GITHUB_REPOSITORY,,}:${version}
 
           Then open http://localhost:8000 and complete the setup wizard.
 

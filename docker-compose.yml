@@ -1,14 +1,14 @@
 services:
-  sluice:
+  llm-rate-limit-proxy:
     build: .
-    image: sluice:local
+    image: llm-rate-limit-proxy:local
     # Published to loopback only. Inside its own namespace the container binds
     # 0.0.0.0 because it must, but what reaches the network is decided here —
     # change this line and nothing else to expose it, deliberately, behind TLS.
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - sluice-data:/data
+      - llm-rate-limit-proxy-data:/data
     environment:
       # Set to true when a TLS-terminating reverse proxy sits in front, so the
       # session cookie is marked Secure.
@@ -21,4 +21,4 @@ services:
       - no-new-privileges:true
 
 volumes:
-  sluice-data:
+  llm-rate-limit-proxy-data:

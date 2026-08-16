@@ -138,8 +138,10 @@ async fn proxy_rejects_missing_key() {
 
 #[tokio::test]
 async fn fails_over_from_bad_key_to_good_key() {
-    use sluice::auth::{hash_password, new_client_key};
-    use sluice::config::{Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION};
+    use llm_rate_limit_proxy::auth::{hash_password, new_client_key};
+    use llm_rate_limit_proxy::config::{
+        Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION,
+    };
 
     let mock = support::start_failover_mock("bad-key").await;
     let (client_secret, client_rec) = new_client_key("test", "admin");
@@ -204,8 +206,10 @@ async fn served_by(s: &Server, secret: &str, body: String) -> String {
 
 #[tokio::test]
 async fn a_conversation_keeps_one_key_as_its_transcript_grows() {
-    use sluice::auth::{hash_password, new_client_key};
-    use sluice::config::{Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION};
+    use llm_rate_limit_proxy::auth::{hash_password, new_client_key};
+    use llm_rate_limit_proxy::config::{
+        Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION,
+    };
 
     let mock = support::start_key_reporting_mock().await;
     let (client_secret, client_rec) = new_client_key("test", "admin");
@@ -260,8 +264,10 @@ async fn a_conversation_keeps_one_key_as_its_transcript_grows() {
 
 #[tokio::test]
 async fn a_rate_limited_key_is_benched_so_the_next_request_skips_it() {
-    use sluice::auth::{hash_password, new_client_key};
-    use sluice::config::{Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION};
+    use llm_rate_limit_proxy::auth::{hash_password, new_client_key};
+    use llm_rate_limit_proxy::config::{
+        Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION,
+    };
     use std::sync::atomic::Ordering;
 
     let (mock, sick_hits) = support::start_benching_mock("sick-key").await;
@@ -315,8 +321,8 @@ async fn a_rate_limited_key_is_benched_so_the_next_request_skips_it() {
 
 #[tokio::test]
 async fn requests_past_the_concurrency_cap_are_shed_with_retry_after() {
-    use sluice::auth::{hash_password, new_client_key};
-    use sluice::config::{
+    use llm_rate_limit_proxy::auth::{hash_password, new_client_key};
+    use llm_rate_limit_proxy::config::{
         Provider, ProviderKey, Role, Settings, StoredConfig, User, STORE_VERSION,
     };
 
@@ -383,8 +389,10 @@ async fn requests_past_the_concurrency_cap_are_shed_with_retry_after() {
 
 #[tokio::test]
 async fn pressure_on_a_model_is_detected_across_keys_and_reported() {
-    use sluice::auth::{hash_password, new_client_key};
-    use sluice::config::{Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION};
+    use llm_rate_limit_proxy::auth::{hash_password, new_client_key};
+    use llm_rate_limit_proxy::config::{
+        Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION,
+    };
 
     // Every key is rebuffed, so failing over cannot help — the signature of a
     // model-scoped limit rather than a per-key one.
@@ -439,8 +447,8 @@ async fn pressure_on_a_model_is_detected_across_keys_and_reported() {
 
 #[tokio::test]
 async fn the_catalog_is_cached_and_lists_aliases_alongside_real_models() {
-    use sluice::auth::{hash_password, new_client_key};
-    use sluice::config::{
+    use llm_rate_limit_proxy::auth::{hash_password, new_client_key};
+    use llm_rate_limit_proxy::config::{
         Alias, AliasTarget, Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION,
     };
     use std::sync::atomic::Ordering;
@@ -924,7 +932,7 @@ async fn deadline_exceeded_returns_504() {
         .client
         .post(format!("{}/v1/chat/completions", s.base_url))
         .header("authorization", format!("Bearer {key}"))
-        .header("x-sluice-deadline-ms", "150")
+        .header("x-llm-rate-limit-proxy-deadline-ms", "150")
         .body("{}")
         .send()
         .await
@@ -962,8 +970,8 @@ async fn streaming_request_gets_heartbeat_and_body() {
 
 #[tokio::test]
 async fn virtual_model_falls_back_across_providers() {
-    use sluice::auth::{hash_password, new_client_key};
-    use sluice::config::{
+    use llm_rate_limit_proxy::auth::{hash_password, new_client_key};
+    use llm_rate_limit_proxy::config::{
         Alias, AliasTarget, Provider, ProviderKey, Role, StoredConfig, User, STORE_VERSION,
     };
 
@@ -1065,7 +1073,10 @@ async fn metrics_records_proxied_requests() {
     let m = s.get("/metrics").await;
     assert_eq!(m.status(), 200);
     let body = m.text().await.unwrap();
-    assert!(body.contains("sluice_requests_total"), "no metric: {body}");
+    assert!(
+        body.contains("llm_rate_limit_proxy_requests_total"),
+        "no metric: {body}"
+    );
     assert!(
         body.contains(r#"model="gpt-x""#),
         "model not recorded: {body}"
@@ -1401,7 +1412,11 @@ async fn prometheus_can_scrape_metrics_with_credentials() {
         .await
         .unwrap();
     assert_eq!(good.status(), 200);
-    assert!(good.text().await.unwrap().contains("sluice_requests_total"));
+    assert!(good
+        .text()
+        .await
+        .unwrap()
+        .contains("llm_rate_limit_proxy_requests_total"));
 
     let wrong = anon
         .get(format!("{}/metrics", s.base_url))
@@ -1475,14 +1490,14 @@ async fn the_new_measurements_are_actually_recorded() {
 
     let prom = s.get("/metrics").await.text().await.unwrap();
     for family in [
-        "sluice_ttft_ms",
-        "sluice_tokens_per_second",
-        "sluice_queue_wait_ms",
-        "sluice_finish_reason_total",
-        "sluice_request_shape",
-        "sluice_events_total",
-        "sluice_stream_requests_total",
-        "sluice_active_requests",
+        "llm_rate_limit_proxy_ttft_ms",
+        "llm_rate_limit_proxy_tokens_per_second",
+        "llm_rate_limit_proxy_queue_wait_ms",
+        "llm_rate_limit_proxy_finish_reason_total",
+        "llm_rate_limit_proxy_request_shape",
+        "llm_rate_limit_proxy_events_total",
+        "llm_rate_limit_proxy_stream_requests_total",
+        "llm_rate_limit_proxy_active_requests",
     ] {
         assert!(prom.contains(family), "{family} missing from /metrics");
     }
@@ -1500,7 +1515,7 @@ async fn refusals_are_counted() {
     for _ in 0..3 {
         s.client
             .post(format!("{}/v1/chat/completions", s.base_url))
-            .header("authorization", "Bearer slk_wrong")
+            .header("authorization", "Bearer lrlp_wrong")
             .body("{}")
             .send()
             .await
@@ -1523,8 +1538,8 @@ async fn refusals_are_counted() {
 /// expensive happens — but must never lock out the machine it runs on.
 #[tokio::test]
 async fn a_source_allowlist_refuses_everyone_else_but_never_loopback() {
-    use sluice::auth::{hash_password, new_client_key};
-    use sluice::config::{
+    use llm_rate_limit_proxy::auth::{hash_password, new_client_key};
+    use llm_rate_limit_proxy::config::{
         Provider, ProviderKey, Role, Settings, StoredConfig, User, STORE_VERSION,
     };
 

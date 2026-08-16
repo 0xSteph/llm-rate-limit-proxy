@@ -16,7 +16,7 @@ async fn hundred_clients_zero_upstream_rate_violations() {
     // Mock enforces 40 req / 1s per key; the proxy runs with a 1s provider window
     // (+1s jitter margin), so it stays comfortably under that limit.
     let mock = start_enforcing_mock(rpm, Duration::from_millis(1000)).await;
-    let s = Server::start_with_env(&[("SLUICE_PROVIDER_WINDOW_MS", "1000")]).await;
+    let s = Server::start_with_env(&[("LLM_RATE_LIMIT_PROXY_PROVIDER_WINDOW_MS", "1000")]).await;
     let key = s
         .complete_wizard_get_key(
             "admin",

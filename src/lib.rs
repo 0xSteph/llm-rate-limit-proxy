@@ -245,7 +245,7 @@ async fn shutdown_signal() {
     }
 }
 
-/// `sluice --health`: probe our own /health endpoint and exit 0/1. Exists because
+/// `llm-rate-limit-proxy --health`: probe our own /health endpoint and exit 0/1. Exists because
 /// the scratch container image has no shell or curl for HEALTHCHECK.
 fn health_probe() -> ! {
     use std::io::{Read, Write};
@@ -280,7 +280,7 @@ pub async fn run() {
     });
     if let Err(e) = writable {
         eprintln!(
-            "sluice cannot start: DATA_DIR {} is not writable ({e})",
+            "llm-rate-limit-proxy cannot start: DATA_DIR {} is not writable ({e})",
             data_dir.display()
         );
         std::process::exit(1);
@@ -290,7 +290,7 @@ pub async fn run() {
         Ok(Some(sc)) => sc,
         Ok(None) => config::StoredConfig::default(),
         Err(e) => {
-            eprintln!("sluice cannot start: {e}");
+            eprintln!("llm-rate-limit-proxy cannot start: {e}");
             std::process::exit(1);
         }
     };
@@ -307,7 +307,7 @@ pub async fn run() {
     let ledger = Arc::new(ledger::Ledger::load(Some(data_dir.join("usage.json"))));
 
     // Undocumented test knob; 60s is the contract. Lets pacing tests run fast.
-    let provider_window = env_or("SLUICE_PROVIDER_WINDOW_MS", "")
+    let provider_window = env_or("LLM_RATE_LIMIT_PROXY_PROVIDER_WINDOW_MS", "")
         .parse::<u64>()
         .map(Duration::from_millis)
         .unwrap_or(pool::PROVIDER_WINDOW);
@@ -346,7 +346,7 @@ pub async fn run() {
         let history = state.history.clone();
         let sampled = state.clone();
         let sample_secs = env_or(
-            "SLUICE_HISTORY_SAMPLE_SECS",
+            "LLM_RATE_LIMIT_PROXY_HISTORY_SAMPLE_SECS",
             &history::SAMPLE_SECS.to_string(),
         )
         .parse::<u64>()
@@ -431,7 +431,10 @@ pub async fn run() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind listener");
-    println!("sluice v{} listening on {addr}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "llm-rate-limit-proxy v{} listening on {addr}",
+        env!("CARGO_PKG_VERSION")
+    );
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

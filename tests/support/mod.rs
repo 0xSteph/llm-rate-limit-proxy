@@ -1,4 +1,4 @@
-//! End-to-end test harness: boots the real `sluice` binary against a throwaway
+//! End-to-end test harness: boots the real `llm-rate-limit-proxy` binary against a throwaway
 //! DATA_DIR on a free port, waits for it to become healthy, and exposes a cookie-
 //! aware HTTP client that does not auto-follow redirects (so tests can assert on
 //! the fail-closed 303s).
@@ -30,17 +30,17 @@ impl Server {
     /// Boot with a pre-written config store (superuser already set up), for
     /// scenarios the wizard can't express — e.g. multiple provider keys.
     pub async fn start_seeded(
-        store: &sluice::config::StoredConfig,
+        store: &llm_rate_limit_proxy::config::StoredConfig,
         extra: &[(&str, &str)],
     ) -> Server {
         let dir = tempfile::tempdir().unwrap();
-        sluice::config::save(dir.path(), store).expect("seed config store");
+        llm_rate_limit_proxy::config::save(dir.path(), store).expect("seed config store");
         Self::spawn(dir, extra).await
     }
 
     async fn spawn(data_dir: tempfile::TempDir, extra: &[(&str, &str)]) -> Server {
         let port = free_port();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sluice"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_llm-rate-limit-proxy"));
         cmd.env("HOST", "127.0.0.1")
             .env("PORT", port.to_string())
             .env("DATA_DIR", data_dir.path())
@@ -49,7 +49,7 @@ impl Server {
         for (k, v) in extra {
             cmd.env(k, v);
         }
-        let mut child = cmd.spawn().expect("spawn sluice binary");
+        let mut child = cmd.spawn().expect("spawn llm-rate-limit-proxy binary");
 
         let base_url = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::builder()
@@ -60,7 +60,7 @@ impl Server {
 
         for _ in 0..100 {
             if let Ok(Some(status)) = child.try_wait() {
-                panic!("sluice exited before becoming healthy: {status}");
+                panic!("llm-rate-limit-proxy exited before becoming healthy: {status}");
             }
             if let Ok(r) = client.get(format!("{base_url}/health")).send().await {
                 if r.status().is_success() {
@@ -75,7 +75,7 @@ impl Server {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let _ = child.kill();
-        panic!("sluice did not become healthy within 10s");
+        panic!("llm-rate-limit-proxy did not become healthy within 10s");
     }
 
     pub async fn get(&self, path: &str) -> reqwest::Response {

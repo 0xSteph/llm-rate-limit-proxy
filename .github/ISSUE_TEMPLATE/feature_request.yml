@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest something this should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that this makes hard or impossible?
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: Optional. A rough shape is fine.
+  - type: markdown
+    attributes:
+      value: |
+        This project is deliberately narrow — keeping a coding agent alive against
+        per-key rate limits. Requests that widen that scope may be declined even
+        when they are good ideas.

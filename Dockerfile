@@ -27,7 +27,7 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 RUN mkdir -p /seed/data
 
 FROM scratch
-COPY --from=build /src/target/release/sluice /sluice
+COPY --from=build /src/target/release/llm-rate-limit-proxy /llm-rate-limit-proxy
 COPY --from=build --chown=10001:10001 /seed/data /data
 
 # Unprivileged by construction: no passwd file exists, so the numeric id is the
@@ -43,6 +43,6 @@ EXPOSE 8000
 
 # The binary probes itself — there is no curl in here to do it with.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/sluice", "--health"]
+    CMD ["/llm-rate-limit-proxy", "--health"]
 
-ENTRYPOINT ["/sluice"]
+ENTRYPOINT ["/llm-rate-limit-proxy"]

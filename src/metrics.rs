@@ -229,28 +229,32 @@ impl Metrics {
     /// Prometheus exposition for scrapers.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        out.push_str("# HELP sluice_requests_total Requests by client/model/status.\n");
-        out.push_str("# TYPE sluice_requests_total counter\n");
+        out.push_str(
+            "# HELP llm_rate_limit_proxy_requests_total Requests by client/model/status.\n",
+        );
+        out.push_str("# TYPE llm_rate_limit_proxy_requests_total counter\n");
         for ((client, model, status), count) in self.requests.lock().unwrap().iter() {
             out.push_str(&format!(
-                "sluice_requests_total{{client=\"{client}\",model=\"{model}\",status=\"{status}\"}} {count}\n"
+                "llm_rate_limit_proxy_requests_total{{client=\"{client}\",model=\"{model}\",status=\"{status}\"}} {count}\n"
             ));
         }
-        out.push_str("# HELP sluice_tokens_total Tokens by model and direction.\n");
-        out.push_str("# TYPE sluice_tokens_total counter\n");
+        out.push_str("# HELP llm_rate_limit_proxy_tokens_total Tokens by model and direction.\n");
+        out.push_str("# TYPE llm_rate_limit_proxy_tokens_total counter\n");
         for (model, (p, c)) in self.tokens.lock().unwrap().iter() {
             out.push_str(&format!(
-                "sluice_tokens_total{{model=\"{model}\",direction=\"prompt\"}} {p}\n"
+                "llm_rate_limit_proxy_tokens_total{{model=\"{model}\",direction=\"prompt\"}} {p}\n"
             ));
             out.push_str(&format!(
-                "sluice_tokens_total{{model=\"{model}\",direction=\"completion\"}} {c}\n"
+                "llm_rate_limit_proxy_tokens_total{{model=\"{model}\",direction=\"completion\"}} {c}\n"
             ));
         }
-        out.push_str("# HELP sluice_lane_requests_total Requests served per provider lane.\n");
-        out.push_str("# TYPE sluice_lane_requests_total counter\n");
+        out.push_str(
+            "# HELP llm_rate_limit_proxy_lane_requests_total Requests served per provider lane.\n",
+        );
+        out.push_str("# TYPE llm_rate_limit_proxy_lane_requests_total counter\n");
         for (lane, count) in self.lanes.lock().unwrap().iter() {
             out.push_str(&format!(
-                "sluice_lane_requests_total{{provider=\"{lane}\"}} {count}\n"
+                "llm_rate_limit_proxy_lane_requests_total{{provider=\"{lane}\"}} {count}\n"
             ));
         }
 
@@ -258,12 +262,12 @@ impl Metrics {
         // expects and what lets a scraper compute rate()-based averages itself.
         let summaries: [(&str, &str, &SummaryMap); 2] = [
             (
-                "sluice_ttft_ms",
+                "llm_rate_limit_proxy_ttft_ms",
                 "Time to first byte from upstream.",
                 &self.ttft_ms,
             ),
             (
-                "sluice_tokens_per_second",
+                "llm_rate_limit_proxy_tokens_per_second",
                 "Generation speed.",
                 &self.tok_per_sec,
             ),
@@ -278,76 +282,87 @@ impl Metrics {
         }
 
         let q = *self.queue_wait_ms.lock().unwrap();
-        out.push_str("# HELP sluice_queue_wait_ms Time waiting for a rate slot.\n");
-        out.push_str("# TYPE sluice_queue_wait_ms summary\n");
-        out.push_str(&format!("sluice_queue_wait_ms_sum {}\n", q.sum));
-        out.push_str(&format!("sluice_queue_wait_ms_count {}\n", q.count));
-        out.push_str(&format!("sluice_queue_wait_ms_max {}\n", q.max));
+        out.push_str("# HELP llm_rate_limit_proxy_queue_wait_ms Time waiting for a rate slot.\n");
+        out.push_str("# TYPE llm_rate_limit_proxy_queue_wait_ms summary\n");
+        out.push_str(&format!(
+            "llm_rate_limit_proxy_queue_wait_ms_sum {}\n",
+            q.sum
+        ));
+        out.push_str(&format!(
+            "llm_rate_limit_proxy_queue_wait_ms_count {}\n",
+            q.count
+        ));
+        out.push_str(&format!(
+            "llm_rate_limit_proxy_queue_wait_ms_max {}\n",
+            q.max
+        ));
 
         out.push_str(
-            "# HELP sluice_finish_reason_total How generations ended; 'length' is truncation.\n",
+            "# HELP llm_rate_limit_proxy_finish_reason_total How generations ended; 'length' is truncation.\n",
         );
-        out.push_str("# TYPE sluice_finish_reason_total counter\n");
+        out.push_str("# TYPE llm_rate_limit_proxy_finish_reason_total counter\n");
         for ((model, reason), n) in self.finish.lock().unwrap().iter() {
             out.push_str(&format!(
-                "sluice_finish_reason_total{{model=\"{model}\",reason=\"{reason}\"}} {n}\n"
+                "llm_rate_limit_proxy_finish_reason_total{{model=\"{model}\",reason=\"{reason}\"}} {n}\n"
             ));
         }
 
         out.push_str(
-            "# HELP sluice_model_extras_total Tool calls emitted and reasoning tokens burned.\n",
+            "# HELP llm_rate_limit_proxy_model_extras_total Tool calls emitted and reasoning tokens burned.\n",
         );
-        out.push_str("# TYPE sluice_model_extras_total counter\n");
+        out.push_str("# TYPE llm_rate_limit_proxy_model_extras_total counter\n");
         for (model, (tools, reasoning)) in self.extras.lock().unwrap().iter() {
             out.push_str(&format!(
-                "sluice_model_extras_total{{model=\"{model}\",kind=\"tool_calls\"}} {tools}\n"
+                "llm_rate_limit_proxy_model_extras_total{{model=\"{model}\",kind=\"tool_calls\"}} {tools}\n"
             ));
             out.push_str(&format!(
-                "sluice_model_extras_total{{model=\"{model}\",kind=\"reasoning_tokens\"}} {reasoning}\n"
+                "llm_rate_limit_proxy_model_extras_total{{model=\"{model}\",kind=\"reasoning_tokens\"}} {reasoning}\n"
             ));
         }
 
-        out.push_str("# HELP sluice_request_shape What harnesses ask for: depth, tools, output cap, temperature x100.\n");
-        out.push_str("# TYPE sluice_request_shape summary\n");
+        out.push_str("# HELP llm_rate_limit_proxy_request_shape What harnesses ask for: depth, tools, output cap, temperature x100.\n");
+        out.push_str("# TYPE llm_rate_limit_proxy_request_shape summary\n");
         for (client, s) in self.shape.lock().unwrap().iter() {
             for (dim, sm) in ["messages", "tools", "max_tokens", "temperature_x100"]
                 .iter()
                 .zip(s.iter())
             {
                 out.push_str(&format!(
-                    "sluice_request_shape_sum{{client=\"{client}\",dim=\"{dim}\"}} {}\n",
+                    "llm_rate_limit_proxy_request_shape_sum{{client=\"{client}\",dim=\"{dim}\"}} {}\n",
                     sm.sum
                 ));
                 out.push_str(&format!(
-                    "sluice_request_shape_count{{client=\"{client}\",dim=\"{dim}\"}} {}\n",
+                    "llm_rate_limit_proxy_request_shape_count{{client=\"{client}\",dim=\"{dim}\"}} {}\n",
                     sm.count
                 ));
             }
         }
 
         out.push_str(
-            "# HELP sluice_events_total Retries, benched lanes, sheds, refusals, deadlines.\n",
+            "# HELP llm_rate_limit_proxy_events_total Retries, benched lanes, sheds, refusals, deadlines.\n",
         );
-        out.push_str("# TYPE sluice_events_total counter\n");
+        out.push_str("# TYPE llm_rate_limit_proxy_events_total counter\n");
         for (kind, n) in self.events.lock().unwrap().iter() {
-            out.push_str(&format!("sluice_events_total{{kind=\"{kind}\"}} {n}\n"));
+            out.push_str(&format!(
+                "llm_rate_limit_proxy_events_total{{kind=\"{kind}\"}} {n}\n"
+            ));
         }
 
-        out.push_str("# HELP sluice_stream_requests_total Streaming vs buffered.\n");
-        out.push_str("# TYPE sluice_stream_requests_total counter\n");
+        out.push_str("# HELP llm_rate_limit_proxy_stream_requests_total Streaming vs buffered.\n");
+        out.push_str("# TYPE llm_rate_limit_proxy_stream_requests_total counter\n");
         out.push_str(&format!(
-            "sluice_stream_requests_total{{stream=\"true\"}} {}\n",
+            "llm_rate_limit_proxy_stream_requests_total{{stream=\"true\"}} {}\n",
             self.streamed.load(Ordering::Relaxed)
         ));
         out.push_str(&format!(
-            "sluice_stream_requests_total{{stream=\"false\"}} {}\n",
+            "llm_rate_limit_proxy_stream_requests_total{{stream=\"false\"}} {}\n",
             self.buffered.load(Ordering::Relaxed)
         ));
 
-        out.push_str("# HELP sluice_active_requests Requests in flight right now.\n");
-        out.push_str("# TYPE sluice_active_requests gauge\n");
+        out.push_str("# HELP llm_rate_limit_proxy_active_requests Requests in flight right now.\n");
+        out.push_str("# TYPE llm_rate_limit_proxy_active_requests gauge\n");
         out.push_str(&format!(
-            "sluice_active_requests {}\n",
+            "llm_rate_limit_proxy_active_requests {}\n",
             self.active.load(Ordering::Relaxed)
         ));
         out
@@ -554,8 +569,12 @@ mod tests {
         m.record_request("alice", "gpt", "200");
         m.record_request("alice", "gpt", "429");
         let out = m.render();
-        assert!(out.contains(r#"sluice_requests_total{client="alice",model="gpt",status="200"} 2"#));
-        assert!(out.contains(r#"sluice_requests_total{client="alice",model="gpt",status="429"} 1"#));
+        assert!(out.contains(
+            r#"llm_rate_limit_proxy_requests_total{client="alice",model="gpt",status="200"} 2"#
+        ));
+        assert!(out.contains(
+            r#"llm_rate_limit_proxy_requests_total{client="alice",model="gpt",status="429"} 1"#
+        ));
     }
 
     #[test]
@@ -581,7 +600,7 @@ mod tests {
         let series = m
             .render()
             .lines()
-            .filter(|l| l.starts_with("sluice_requests_total{"))
+            .filter(|l| l.starts_with("llm_rate_limit_proxy_requests_total{"))
             .count();
         assert!(series <= MAX_SERIES + 1, "series not capped: {series}");
         assert!(m.render().contains(r#"model="other""#));

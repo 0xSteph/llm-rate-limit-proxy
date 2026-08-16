@@ -22,7 +22,7 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 
 /// Optional absolute wall-clock budget for the whole request (queue + retries +
 /// upstream), set by the client via this header.
-const DEADLINE_HEADER: &str = "x-sluice-deadline-ms";
+const DEADLINE_HEADER: &str = "x-llm-rate-limit-proxy-deadline-ms";
 
 type Tx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
 

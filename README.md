@@ -1,47 +1,110 @@
-# Sluice
+# LLM Rate Limit Proxy
 
-A rate-limit-aware, multi-provider proxy for OpenAI-compatible LLM APIs.
+**Your coding agent never sees a rate limit again.**
 
-Point your agent harness at one endpoint with one key. Sluice paces requests
-across a pool of upstream API keys so the harness never sees a rate limit, fails
-over when a key or a provider misbehaves, and reports what is actually happening
-underneath.
+Point Cline, Aider or any OpenAI-compatible harness at one endpoint with one key.
+It pools every API key you own across every provider you use, paces each request
+inside that key's real limit, and fails over when a key or a provider misbehaves
+— so the 429 that used to kill your agent mid-task never reaches it.
 
-## Why
+Rust · single 4 MB binary · self-hosted · your keys never leave your machine.
 
-Free and low tier LLM APIs cap requests per minute per key. When an agent harness
-hits that cap the upstream returns 429 and most harnesses abort the task outright.
-Sluice sits in between and makes the limit invisible: requests queue rather than
-fail, and streaming clients are held open with SSE heartbeats while they wait.
+[![CI](https://github.com/0xSteph/llm-rate-limit-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/0xSteph/llm-rate-limit-proxy/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/0xSteph/llm-rate-limit-proxy?color=f0883e)](https://github.com/0xSteph/llm-rate-limit-proxy/releases)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-It is not a way around anyone's terms of service. Each key is held to its own
-limit; the proxy makes agents patient enough to live within the budget you
-already have.
+![A 30-file refactor dying on a 429, then the same run completing through the proxy](docs/demo.gif)
 
-## What it does
+Same agent. Same key. Same provider, same rate limit. The only difference is
+what sits in the middle.
 
-**Pacing and routing**
+## The problem
 
-- One lane per API key, each with an exact sliding-window limiter and a jitter
-  margin so a boundary-timed request can't land inside the provider's window
-- A single global FIFO queue across all clients — slots are granted in arrival
-  order, so no client can starve another
-- Conversations stick to one key via rendezvous hashing, keeping any upstream
-  prefix cache warm. Adding or removing a key relocates only that key's share of
-  conversations rather than remapping all of them
-- Everything else takes the least-loaded lane, spreading concurrent work across
-  keys instead of stacking it on the first one
+Free and low-tier LLM APIs cap requests per minute, per key. Your agent burns
+through that cap in one refactor, the provider returns `429`, and the harness
+aborts — usually halfway through a multi-file edit, usually without saving its
+work.
+
+The usual workarounds are all bad. Wait and retry by hand. Juggle three accounts
+and paste a different key each time. Pay for a tier you need for ten minutes a
+day.
+
+## Quickstart
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0xSteph/llm-rate-limit-proxy/master/install.sh | sh
+```
+
+Downloads the right binary, verifies its checksum, installs a hardened systemd
+service, and starts it. Open `http://localhost:8000`, and the wizard walks you
+through an admin account, your first provider key, and mints your client key.
+
+Then point your harness at it:
+
+| Harness | Setting |
+|---|---|
+| **Cline / Roo Code** | Provider: *OpenAI Compatible* · Base URL `http://localhost:8000/v1` |
+| **Aider** | `aider --openai-api-base http://localhost:8000/v1 --openai-api-key lrlp_...` |
+| **Continue** | `"apiBase": "http://localhost:8000/v1"` on an `openai` provider |
+| **Cursor** | Settings → Models → Override OpenAI Base URL. Works for API-key models; it can't help with Cursor's own subscription models, which are rate limited by Cursor, not by a key you hold |
+| **Anything else** | Any client that takes an OpenAI-compatible base URL |
+
+```sh
+export OPENAI_BASE_URL=http://localhost:8000/v1
+export OPENAI_API_KEY=lrlp_your_client_key
+```
+
+Re-run the installer to upgrade; your keys and settings are untouched.
+
+> This proxy speaks the **OpenAI-compatible** API (`/v1/chat/completions`, `Bearer`
+> auth). Claude Code and other Anthropic-protocol clients are not supported yet —
+> see [Roadmap](#roadmap).
+
+## How it works
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img alt="The proxy sits between your agent and your providers: one FIFO queue feeds one lane per API key, each paced to its own limit, and 429s are absorbed rather than returned" src="docs/architecture-light.svg">
+</picture>
+
+**It makes your agent patient rather than making your limits bigger.** Requests
+queue instead of failing, and streaming clients are held open with SSE heartbeats
+while they wait.
+
+**Every key gets its own lane.** Each lane has an exact sliding-window limiter
+plus a jitter margin, so a boundary-timed request can't land inside the
+provider's window. A single global FIFO queue feeds them, granting slots in
+arrival order so no client can starve another.
+
+**Conversations stick to one key** via rendezvous hashing, keeping any upstream
+prefix cache warm. Adding or removing a key relocates only that key's share of
+conversations rather than remapping all of them.
+
+**A rebuffed key gets benched** for as long as its `Retry-After` asks, so the
+next request doesn't rediscover the same wall — it goes to another key, or
+another provider entirely.
+
+To be explicit about what this is not: it does not raise anyone's rate limit and
+is not a way around anyone's terms of service. Each key is held to its own
+limit, slightly under it in fact. Throughput is unchanged. What changes is that
+the limit stops being *your* problem and becomes the proxy's.
+
+<details>
+<summary><b>Everything else it does</b></summary>
+
+**Routing**
+
+- Everything without conversation affinity takes the least-loaded lane,
+  spreading concurrent work across keys instead of stacking it on the first one
 
 **Resilience**
 
 - Automatic failover across keys and across providers
-- A rebuffed key is benched for as long as its `Retry-After` asks (clamped), so
-  the next request doesn't rediscover the same wall
 - A model-pressure governor for provider-side concurrency caps that key failover
   cannot relieve. Detection is behavioral — the same model rebuffed on two
   different keys within seconds — so it needs no knowledge of any provider's
   error wording
-- Optional absolute request deadlines via `X-Sluice-Deadline-Ms`
+- Optional absolute request deadlines via `X-Llm-Rate-Limit-Proxy-Deadline-Ms`
 - Bounded concurrency with load shedding
 
 **Multi-provider**
@@ -62,35 +125,41 @@ already have.
 - `/api/pressure` reports models held back by provider-side limits, so a stalled
   agent is never mistaken for an idle proxy
 
-## Install
+</details>
 
-**One line.** Downloads the right binary, verifies its checksum, installs a
-hardened systemd service, and starts it:
+## The console
+
+![The console: request counts, success rate, throughput, tokens moved, and a request-over-time chart](docs/dashboard.png)
+
+Content-blind by construction — counts, sizes and latencies, never message
+content. `/metrics` serves the same numbers as Prometheus text.
+
+## Why not just use LiteLLM?
+
+Different jobs. LiteLLM is a broad translation layer across 100+ providers with
+budgets, teams, and a Python stack behind it. If you need that, use it.
+
+This is one thing done narrowly: keeping a *coding agent* alive against per-key
+rate limits.
+
+| | llm-rate-limit-proxy | LiteLLM Proxy |
+|---|---|---|
+| Runtime | One 4 MB static binary | Python + dependency tree |
+| Providers | Any OpenAI-compatible endpoint | 100+, with protocol translation |
+| On hitting a limit | Queues and paces; client never sees `429` | Retries and fallbacks |
+| Streaming under queue | Held open with SSE heartbeats | Client waits on the request |
+| Rate-limit correctness | Load test asserts **zero** upstream violations at 100 concurrent clients | — |
+| Scope | Deliberately small | Deliberately broad |
+
+## Other ways to install
+
+**Container:**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0xSteph/sluice/master/install.sh | sh
-```
-
-Then open `http://localhost:8000` and finish the wizard. Re-run the same command
-to upgrade; your keys and settings are untouched.
-
-While the repository is private, pass a token that can read it:
-
-```sh
-SLUICE_TOKEN=ghp_... curl -fsSL https://raw.githubusercontent.com/0xSteph/sluice/master/install.sh | sh
-```
-
-It binds loopback, runs as an unprivileged `sluice` user with no shell, stores
-data in `/var/lib/sluice` at mode 0700, and the unit drops every capability.
-Override with `SLUICE_PORT`, `SLUICE_HOST`, `SLUICE_DATA_DIR`.
-
-**Container** — if you would rather not install anything:
-
-```sh
-docker run -d --name sluice \
+docker run -d --name llm-rate-limit-proxy \
   -p 127.0.0.1:8000:8000 \
-  -v sluice-data:/data \
-  ghcr.io/0xsteph/sluice:latest
+  -v llm-rate-limit-proxy-data:/data \
+  ghcr.io/0xsteph/llm-rate-limit-proxy:latest
 ```
 
 Or with compose, which also applies the hardening (read-only root, no
@@ -103,10 +172,10 @@ docker compose up -d
 **Binary** — attached to each release for `linux/amd64` and `linux/arm64`:
 
 ```sh
-curl -fsSLO https://github.com/0xSteph/sluice/releases/latest/download/SHA256SUMS
-curl -fsSLO https://github.com/0xSteph/sluice/releases/latest/download/sluice-VERSION-linux-amd64.tar.gz
+curl -fsSLO https://github.com/0xSteph/llm-rate-limit-proxy/releases/latest/download/SHA256SUMS
+curl -fsSLO https://github.com/0xSteph/llm-rate-limit-proxy/releases/latest/download/llm-rate-limit-proxy-VERSION-linux-amd64.tar.gz
 sha256sum -c SHA256SUMS --ignore-missing
-tar xzf sluice-*-linux-amd64.tar.gz && ./sluice-amd64
+tar xzf llm-rate-limit-proxy-*-linux-amd64.tar.gz && ./llm-rate-limit-proxy-amd64
 ```
 
 The binary is extracted from the published image rather than built separately,
@@ -117,8 +186,8 @@ worth taking on Windows: the image is Linux-only and Docker Desktop is a heavier
 dependency than the binary it would run.
 
 ```powershell
-# unzip sluice-VERSION-windows-amd64.zip, then:
-$env:DATA_DIR="$env:LOCALAPPDATA\sluice"; $env:HOST="127.0.0.1"; .\sluice.exe
+# unzip llm-rate-limit-proxy-VERSION-windows-amd64.zip, then:
+$env:DATA_DIR="$env:LOCALAPPDATA\llm-rate-limit-proxy"; $env:HOST="127.0.0.1"; .\llm-rate-limit-proxy.exe
 ```
 
 One caveat worth knowing: the config store is written mode 0600 on Unix, and
@@ -140,12 +209,11 @@ Images are published on every push to `master` as `:edge`, and on a version tag
 as `:1.2.3`, `:1.2` and `:latest`. `:edge` is whatever just landed; tags are the
 statement that a commit is meant to be run.
 
-Then open `http://localhost:8000/`. The first visitor claims the install: create
-the admin account, add one provider key, and the wizard mints your first client
-key. Point your harness at `http://localhost:8000/v1` with that key.
+## Configuration
 
-Until setup completes the data plane is closed and browsers are sent to the
-wizard.
+The installer binds loopback and runs as an unprivileged `llm-rate-limit-proxy` user with no
+shell, stores data in `/var/lib/llm-rate-limit-proxy` at mode 0700, and the unit drops every
+capability.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -153,15 +221,8 @@ wizard.
 | `DATA_DIR` | `data` | Where the config store and history live |
 | `TRUST_PROXY` | `false` | Trust `X-Forwarded-Proto`; marks the session cookie `Secure` |
 
-Everything else is managed in Settings and applies live.
-
-## Tests
-
-```sh
-cargo test                            # unit + end-to-end
-cargo test --test load -- --ignored   # 100 concurrent clients, asserts zero
-                                      # upstream rate violations
-```
+Everything else is managed in Settings and applies live. Until setup completes
+the data plane is closed and browsers are sent to the wizard.
 
 ## Operations
 
@@ -173,7 +234,7 @@ because a scraper cannot follow a redirect into a login page.
 
 ```yaml
 scrape_configs:
-  - job_name: sluice
+  - job_name: llm-rate-limit-proxy
     basic_auth: { username: admin, password: your-password }
     static_configs: [{ targets: ["localhost:8000"] }]
 ```
@@ -224,7 +285,38 @@ password, and previously minted client keys still working.
 TLS is not built in — terminate it at a reverse proxy and set `TRUST_PROXY=true`
 so the session cookie is marked `Secure`.
 
+## Tests
+
+```sh
+cargo test                            # unit + end-to-end
+cargo test --test load -- --ignored   # 100 concurrent clients, asserts zero
+                                      # upstream rate violations
+```
+
+## Roadmap
+
+- **Anthropic protocol support** (`/v1/messages`, `x-api-key`) so Claude Code
+  and other Anthropic-native clients can sit behind it
+- Per-client budgets and quotas
+- Settings forms for the remaining routes — the API is complete, the console
+  covers most of it
+
 ## Status
 
 Working, tested, and packaged. The settings API is complete; the console
 renders observability and settings forms, though not every route has a form yet.
+
+Issues and PRs welcome.
+
+## License
+
+Licensed under either of
+
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

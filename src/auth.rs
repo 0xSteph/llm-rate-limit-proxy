@@ -26,7 +26,7 @@ const PBKDF2_ROUNDS: u32 = 600_000;
 
 /// Session lifetime and the cookie it rides in.
 pub const SESSION_TTL: u64 = 12 * 3600;
-const SESSION_COOKIE: &str = "sluice_session";
+const SESSION_COOKIE: &str = "llm_rate_limit_proxy_session";
 
 /// Failed-login throttle: after this many failures inside the window, further
 /// attempts are rejected until the window elapses.
@@ -330,7 +330,10 @@ pub async fn require_session_or_basic(
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"sluice metrics\"")],
+            [(
+                header::WWW_AUTHENTICATE,
+                "Basic realm=\"llm-rate-limit-proxy metrics\"",
+            )],
             "credentials required",
         )
             .into_response()
@@ -373,8 +376,8 @@ pub async fn require_admin(
 
 const LOGIN_HTML: &str = r#"<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1">
-<title>Sluice — Sign in</title>
-<h1>Sluice</h1>
+<title>LLM Rate Limit Proxy — Sign in</title>
+<h1>LLM Rate Limit Proxy</h1>
 <form method=post action=/login>
   <p><input name=username placeholder=Username autofocus></p>
   <p><input name=password type=password placeholder=Password></p>
@@ -450,12 +453,12 @@ pub async fn logout(State(state): State<Arc<AppState>>) -> Response {
 
 // --- Client API keys ---------------------------------------------------------
 
-/// Mint a client API key. Returns the one-time secret (`slk_…`) and the record to
+/// Mint a client API key. Returns the one-time secret (`lrlp_…`) and the record to
 /// persist (digest + last-4 only — the secret itself is never stored).
 pub fn new_client_key(label: &str, owner: &str) -> (String, ClientKey) {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).expect("system RNG");
-    let secret = format!("slk_{}", b64(&bytes));
+    let secret = format!("lrlp_{}", b64(&bytes));
     let last4 = secret[secret.len() - 4..].to_string();
     let record = ClientKey {
         label: label.to_string(),
@@ -613,7 +616,8 @@ mod tests {
     #[test]
     fn cookie_parse_finds_session() {
         assert_eq!(
-            session_from_cookies(Some("foo=1; sluice_session=abc.def; bar=2")).as_deref(),
+            session_from_cookies(Some("foo=1; llm_rate_limit_proxy_session=abc.def; bar=2"))
+                .as_deref(),
             Some("abc.def")
         );
         assert!(session_from_cookies(Some("foo=1")).is_none());
@@ -635,14 +639,14 @@ mod tests {
     #[test]
     fn client_key_mint_and_verify() {
         let (secret, rec) = new_client_key("bench", "admin");
-        assert!(secret.starts_with("slk_"));
+        assert!(secret.starts_with("lrlp_"));
         assert_eq!(verify_client_key(&secret, &[rec]).as_deref(), Some("bench"));
     }
 
     #[test]
     fn client_key_unknown_rejected() {
-        assert!(verify_client_key("slk_bogus", &[]).is_none());
+        assert!(verify_client_key("lrlp_bogus", &[]).is_none());
         let (_, rec) = new_client_key("a", "admin");
-        assert!(verify_client_key("slk_wrong", &[rec]).is_none());
+        assert!(verify_client_key("lrlp_wrong", &[rec]).is_none());
     }
 }

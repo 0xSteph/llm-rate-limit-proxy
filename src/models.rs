@@ -1,7 +1,7 @@
 //! The model catalog: one merged `/v1/models` answer across every provider,
 //! served from cache so a harness polling its catalog costs no rate budget.
 //!
-//! Two things make this more than a passthrough. Sluice fronts several
+//! Two things make this more than a passthrough. LLM Rate Limit Proxy fronts several
 //! providers, so a forwarded request would return whichever provider happened
 //! to win the lane and hide the rest; the catalogs are merged instead. And
 //! aliases are real routable names that exist only here, so they belong in the
@@ -140,7 +140,7 @@ pub fn extract(body: &Value) -> Vec<Value> {
 /// Merge provider catalogs and alias names into one OpenAI-shaped response.
 ///
 /// Ids are deduped: the same model offered by two providers is one entry, since
-/// a client picks a name and Sluice decides where it runs. First occurrence
+/// a client picks a name and LLM Rate Limit Proxy decides where it runs. First occurrence
 /// wins, so provider order in config decides which metadata is shown.
 pub fn merge(catalogs: &[Vec<Value>], aliases: &[Alias], limits: &Limits) -> Value {
     let mut seen: Vec<String> = Vec::new();
@@ -166,7 +166,7 @@ pub fn merge(catalogs: &[Vec<Value>], aliases: &[Alias], limits: &Limits) -> Val
                 json!({
                     "id": name,
                     "object": "model",
-                    "owned_by": "sluice",
+                    "owned_by": "llm-rate-limit-proxy",
                 }),
                 name,
             ));
@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(ids(&merged), vec!["same"]);
     }
 
-    /// Aliases are routable names that exist only in Sluice. A harness that
+    /// Aliases are routable names that exist only in LLM Rate Limit Proxy. A harness that
     /// lists models and never sees them cannot offer them to the user at all.
     #[test]
     fn aliases_are_listed_as_models() {
@@ -301,7 +301,7 @@ mod tests {
         );
         assert_eq!(ids(&merged), vec!["shared"]);
         assert_eq!(
-            merged["data"][0]["owned_by"], "sluice",
+            merged["data"][0]["owned_by"], "llm-rate-limit-proxy",
             "the alias is what routing will actually use, so it must be what is shown"
         );
     }

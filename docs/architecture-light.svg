@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 430" width="1000" height="430" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" role="img" aria-label="The proxy sits between your agent and your providers, pacing each API key in its own lane">
+<rect width="1000" height="430" fill="#ffffff"/>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#8c959f"/></marker></defs>
+<text x="30" y="34" fill="#656d76" font-size="11" font-weight="bold" text-anchor="start" opacity="1.0">YOUR AGENT</text>
+<text x="276" y="34" fill="#bc4c00" font-size="11" font-weight="bold" text-anchor="start" opacity="1.0">LLM-RATE-LIMIT-PROXY</text>
+<text x="852" y="34" fill="#656d76" font-size="11" font-weight="bold" text-anchor="start" opacity="1.0">PROVIDERS</text>
+<rect x="30" y="48" width="168" height="168" rx="6" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="50" y="80" fill="#1f2328" font-size="14" font-weight="normal" text-anchor="start" opacity="1.0">Cursor</text>
+<text x="50" y="114" fill="#1f2328" font-size="14" font-weight="normal" text-anchor="start" opacity="1.0">Cline / Roo</text>
+<text x="50" y="148" fill="#1f2328" font-size="14" font-weight="normal" text-anchor="start" opacity="1.0">Aider</text>
+<text x="50" y="182" fill="#1f2328" font-size="14" font-weight="normal" text-anchor="start" opacity="1.0">Continue</text>
+<text x="30" y="240" fill="#656d76" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">one endpoint</text>
+<text x="30" y="258" fill="#656d76" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">one key</text>
+<line x1="206" y1="132" x2="266" y2="132" stroke="#8c959f" stroke-width="1.5" marker-end="url(#ah)"/>
+<rect x="276" y="48" width="500" height="240" rx="8" fill="#ffffff" stroke="#bc4c00" stroke-width="1.5"/>
+<text x="300" y="78" fill="#656d76" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">global FIFO queue</text>
+<rect x="300" y="90" width="11" height="18" rx="2" fill="#bc4c00" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="315" y="90" width="11" height="18" rx="2" fill="#bc4c00" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="330" y="90" width="11" height="18" rx="2" fill="#bc4c00" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="345" y="90" width="11" height="18" rx="2" fill="#bc4c00" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="360" y="90" width="11" height="18" rx="2" fill="#bc4c00" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="375" y="90" width="11" height="18" rx="2" fill="#eaeef2" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="390" y="90" width="11" height="18" rx="2" fill="#eaeef2" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="405" y="90" width="11" height="18" rx="2" fill="#eaeef2" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="420" y="90" width="11" height="18" rx="2" fill="#eaeef2" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="435" y="90" width="11" height="18" rx="2" fill="#eaeef2" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="450" y="90" width="11" height="18" rx="2" fill="#eaeef2" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="465" y="90" width="11" height="18" rx="2" fill="#eaeef2" opacity="1" stroke="#d0d7de" stroke-width="0.5"/>
+<text x="300" y="128" fill="#8c959f" font-size="11" font-weight="normal" text-anchor="start" opacity="1.0">granted in arrival order</text>
+<line x1="300" y1="146" x2="756" y2="146" stroke="#d0d7de" stroke-width="1"/>
+<text x="300" y="170" fill="#656d76" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">one lane per key · exact sliding window</text>
+<text x="300" y="190" fill="#8c959f" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">lane 1</text>
+<text x="360" y="190" fill="#1f2328" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">··4f2a</text>
+<rect x="424" y="180" width="9" height="11" rx="1.5" fill="#1a7f37" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="437" y="180" width="9" height="11" rx="1.5" fill="#1a7f37" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="450" y="180" width="9" height="11" rx="1.5" fill="#1a7f37" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="463" y="180" width="9" height="11" rx="1.5" fill="#eaeef2" stroke="#d0d7de" stroke-width="0.5"/>
+<text x="488" y="190" fill="#656d76" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">40 rpm</text>
+<line x1="556" y1="186" x2="770" y2="186" stroke="#8c959f" stroke-width="1.2" marker-end="url(#ah)"/>
+<text x="300" y="214" fill="#8c959f" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">lane 2</text>
+<text x="360" y="214" fill="#1f2328" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">··b810</text>
+<rect x="424" y="204" width="9" height="11" rx="1.5" fill="#1a7f37" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="437" y="204" width="9" height="11" rx="1.5" fill="#1a7f37" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="450" y="204" width="9" height="11" rx="1.5" fill="#eaeef2" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="463" y="204" width="9" height="11" rx="1.5" fill="#eaeef2" stroke="#d0d7de" stroke-width="0.5"/>
+<text x="488" y="214" fill="#656d76" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">40 rpm</text>
+<line x1="556" y1="210" x2="770" y2="210" stroke="#8c959f" stroke-width="1.2" marker-end="url(#ah)"/>
+<text x="300" y="238" fill="#8c959f" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">lane 3</text>
+<text x="360" y="238" fill="#1f2328" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">··c93d</text>
+<rect x="424" y="228" width="9" height="11" rx="1.5" fill="#1a7f37" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="437" y="228" width="9" height="11" rx="1.5" fill="#eaeef2" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="450" y="228" width="9" height="11" rx="1.5" fill="#eaeef2" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="463" y="228" width="9" height="11" rx="1.5" fill="#eaeef2" stroke="#d0d7de" stroke-width="0.5"/>
+<text x="488" y="238" fill="#656d76" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">30 rpm</text>
+<line x1="556" y1="234" x2="770" y2="234" stroke="#8c959f" stroke-width="1.2" marker-end="url(#ah)"/>
+<text x="300" y="262" fill="#8c959f" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">lane 4</text>
+<text x="360" y="262" fill="#1f2328" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">··7e51</text>
+<rect x="424" y="252" width="9" height="11" rx="1.5" fill="#1a7f37" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="437" y="252" width="9" height="11" rx="1.5" fill="#1a7f37" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="450" y="252" width="9" height="11" rx="1.5" fill="#1a7f37" stroke="#d0d7de" stroke-width="0.5"/>
+<rect x="463" y="252" width="9" height="11" rx="1.5" fill="#1a7f37" stroke="#d0d7de" stroke-width="0.5"/>
+<text x="488" y="262" fill="#656d76" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">30 rpm</text>
+<line x1="556" y1="258" x2="770" y2="258" stroke="#8c959f" stroke-width="1.2" marker-end="url(#ah)"/>
+<rect x="786" y="176" width="184" height="20" rx="4" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="798" y="190" fill="#1f2328" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">groq</text>
+<text x="958" y="190" fill="#8c959f" font-size="11" font-weight="normal" text-anchor="end" opacity="1.0">··4f2a</text>
+<rect x="786" y="200" width="184" height="20" rx="4" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="798" y="214" fill="#1f2328" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">groq</text>
+<text x="958" y="214" fill="#8c959f" font-size="11" font-weight="normal" text-anchor="end" opacity="1.0">··b810</text>
+<rect x="786" y="224" width="184" height="20" rx="4" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="798" y="238" fill="#1f2328" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">cerebras</text>
+<text x="958" y="238" fill="#8c959f" font-size="11" font-weight="normal" text-anchor="end" opacity="1.0">··c93d</text>
+<rect x="786" y="248" width="184" height="20" rx="4" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="798" y="262" fill="#1f2328" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">cerebras</text>
+<text x="958" y="262" fill="#8c959f" font-size="11" font-weight="normal" text-anchor="end" opacity="1.0">··7e51</text>
+<rect x="276" y="306" width="694" height="46" rx="6" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<circle cx="304" cy="329" r="7" fill="none" stroke="#cf222e" stroke-width="1.5"/>
+<line x1="299.5" y1="333.5" x2="308.5" y2="324.5" stroke="#cf222e" stroke-width="1.5"/>
+<text x="322" y="334" font-size="14" fill="#1f2328"><tspan fill="#cf222e" font-weight="bold">429 stops here.</tspan><tspan fill="#1f2328" xml:space="preserve">  Your agent waits — it never sees the limit.</tspan></text>
+<text x="276" y="380" fill="#8c959f" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">Each key is held to its own limit. It hides the wait; it does not raise the ceiling.</text>
+<text x="276" y="400" fill="#8c959f" font-size="12" font-weight="normal" text-anchor="start" opacity="1.0">Conversations stick to one lane via rendezvous hashing, so upstream prefix caches stay warm.</text>
+</svg>

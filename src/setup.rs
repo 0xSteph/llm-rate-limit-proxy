@@ -15,8 +15,8 @@ use crate::{auth, config, AppState};
 
 const SETUP_HTML: &str = r#"<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1">
-<title>Sluice — Setup</title>
-<h1>Claim this Sluice</h1>
+<title>LLM Rate Limit Proxy — Setup</title>
+<h1>Claim this LLM Rate Limit Proxy</h1>
 <p>The first visitor becomes the superuser. Add your admin login and one upstream provider key.</p>
 <form method=post action=/setup>
   <p><input name=username placeholder="Admin username" autofocus></p>
@@ -106,7 +106,7 @@ pub async fn setup_submit(
     ));
 
     Html(format!(
-        "<!doctype html><meta charset=utf-8><title>Sluice — Ready</title>\
+        "<!doctype html><meta charset=utf-8><title>LLM Rate Limit Proxy — Ready</title>\
          <h1>Setup complete</h1>\
          <p>Your client API key (shown only once — copy it now):</p>\
          <pre>{}</pre>\

@@ -1,9 +1,10 @@
 [package]
-name = "sluice"
-version = "0.1.0"
+name = "llm-rate-limit-proxy"
+version = "0.2.0"
 edition = "2021"
-description = "A tiny, private, multi-provider OpenAI-compatible LLM gateway"
-license = "LicenseRef-Sluice-Source-Available"
+description = "A rate-limit-aware, multi-provider proxy for OpenAI-compatible LLM APIs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/0xSteph/llm-rate-limit-proxy"
 rust-version = "1.87"
 keywords = ["proxy", "openai", "llm", "gateway", "rate-limiting"]
 categories = ["network-programming", "web-programming::http-server"]
