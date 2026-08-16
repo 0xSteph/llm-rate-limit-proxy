@@ -134,22 +134,29 @@ the limit stops being *your* problem and becomes the proxy's.
 Content-blind by construction — counts, sizes and latencies, never message
 content. `/metrics` serves the same numbers as Prometheus text.
 
-## Why not just use LiteLLM?
+## How this compares
 
-Different jobs. LiteLLM is a broad translation layer across 100+ providers with
-budgets, teams, and a Python stack behind it. If you need that, use it.
+**[LiteLLM](https://github.com/BerriAI/litellm)** is a broad translation layer
+across 100+ providers with budgets, teams, and a Python stack behind it. Different
+job. If you need that, use it.
+
+**[LimitRateAPI](https://github.com/adrianzhang/LimitRateAPI)** is the closest
+thing to this one — same "queue, don't reject" idea, in Python/FastAPI. Worth a
+look if you'd rather have something you can edit without a Rust toolchain.
 
 This is one thing done narrowly: keeping a *coding agent* alive against per-key
-rate limits.
+rate limits, with the correctness of the pacing treated as the feature.
 
-| | llm-rate-limit-proxy | LiteLLM Proxy |
-|---|---|---|
-| Runtime | One 4 MB static binary | Python + dependency tree |
-| Providers | Any OpenAI-compatible endpoint | 100+, with protocol translation |
-| On hitting a limit | Queues and paces; client never sees `429` | Retries and fallbacks |
-| Streaming under queue | Held open with SSE heartbeats | Client waits on the request |
-| Rate-limit correctness | Load test asserts **zero** upstream violations at 100 concurrent clients | — |
-| Scope | Deliberately small | Deliberately broad |
+| | llm-rate-limit-proxy | LiteLLM Proxy | LimitRateAPI |
+|---|---|---|---|
+| Runtime | One 4 MB static binary | Python + dependency tree | Python + FastAPI |
+| Providers | Any OpenAI-compatible endpoint | 100+, with protocol translation | Any OpenAI-compatible endpoint |
+| On hitting a limit | Queues and paces; client never sees `429` | Retries and fallbacks | Queues and paces |
+| Streaming under queue | Held open with SSE heartbeats | Client waits on the request | SSE forwarded |
+| Multiple keys per provider | One lane per key, least-loaded routing | Yes | Single upstream key |
+| Conversation affinity | Rendezvous hashing keeps prefix caches warm | — | — |
+| Rate-limit correctness | Load test asserts **zero** upstream violations at 100 concurrent clients | — | — |
+| Scope | Deliberately small | Deliberately broad | Deliberately small |
 
 ## Other ways to install
 
@@ -268,7 +275,7 @@ password, and previously minted client keys still working.
 - Binds loopback by default. This process holds every provider key and
   terminates no TLS, so exposing it is a deliberate `HOST=` behind a reverse
   proxy.
-- The container is a 6 MB `scratch` image — no shell, no package manager, no
+- The container is a 6.6 MB `scratch` image — no shell, no package manager, no
   libc — running as an unprivileged uid with a read-only root filesystem and
   all capabilities dropped.
 - Reconfiguring the server is administrator-only. Client keys are self-service
